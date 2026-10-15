@@ -81,6 +81,19 @@
 - [x] 上传历史（本地 history.json，.gitignore 排除）：记录时间/来源/歌曲/songId/大小，重复上传提示，上限 500 条
 - [x] 日志安全审查：审查全部 send/错误透传/状态接口输出点，确认无 cookie 内容泄漏
 
+### 多渠道调查结论（2026-10-15，QQ音乐/微云渠道搁置）
+
+为评估"多渠道开源"价值做的完整调查，结论如下：
+
+| 渠道 | 结论 | 原因 |
+|---|---|---|
+| 网易云云盘 | ✅ 主渠道（已完成） | eapi 通道全链路可用 |
+| 微云（官方MCP） | ⚠️ 协议通但价值存疑 | OAuth2.0+PKCE+SHA1中间状态+分片轮询上传已全部打通（官方接口），**但 QQ音乐 App「微云音乐网盘」不索引外部写入的文件**：实测 4 个文件（含标准 MP3+ID3 / 标准重封装 M4A）放进微云「QQ音乐」文件夹均不显示——2022-2023 年"放微云文件夹当云盘歌曲"的技巧已失效，现在只索引 App 自家接口注册的记录 |
+| QQ音乐云盘 | ❌ 搁置 | 无任何公开开源实现（GitHub 全网搜索确认，唯一"实现"系 AI 编造假端点）；官方 OpenAPI 无云盘上传能力；私有协议走 musics.fcg + zzd sign + qimei 指纹体系，逆向成本高出官方MCP一个数量级且有风控风险；绿钻容量限制（LV8 才 1GB） |
+| 酷狗 | ❌ 放 P2 | 同样无公开协议 |
+
+**决策**：多渠道暂缓，聚焦网易云主线。微云 MCP 上传协议代码保留存档（自定义可导出中间状态的 SHA1 实现 + 两阶段分片轮询，官方 OAuth 一年期 token），未来若腾讯恢复文件夹索引或出现官方开放能力可直接复用。
+
 ### P1 — 体验完善（v0.3）
 
 - [ ] B站合集（season）支持：`seasons_archives_list` 接口，一键传整个合集
@@ -118,7 +131,25 @@
 
 ---
 
-## 五、原则
+## 五、附：微云 MCP 上传协议存档（2026-10-15 实测打通，代码已清理）
+
+> 渠道虽搁置，协议知识保留于此备查。endpoint: `https://www.weiyun.com/api/v3/mcpserver`，鉴权 `Authorization: Bearer <access_token>`，JSON-RPC `tools/call`。OAuth2.0+PKCE 公共客户端（token_endpoint_auth_methods:none，access_token 一年期）。
+
+- **分块**：BLOCK_SIZE=512KB；`lastBlockSize=file_size%BLOCK_SIZE||BLOCK_SIZE`；`checkBlockSize=lastBlockSize%128||128`
+- **block_sha_list**：共享一个 SHA1 实例流式 update，每个块后导出**内部寄存器 h0-h4 的小端序 hex（40字符）**（标准库做不了，需自实现）；最后一块的 sha 用**标准大端 digest**（=file_sha）
+- **check_sha**：SHA1 处理到"最后一块去掉末尾 checkBlockSize 字节"时的中间状态（小端 hex）
+- **check_data**：文件末尾 checkBlockSize 字节的 base64；file_md5 可选（秒传辅助）
+- **上传循环**（关键：每轮**重新预上传**获取缺口通道，不是一次通道列表传到底）：
+  1. 预上传（filename/file_size/file_sha/block_sha_list/check_sha/check_data/pdir_key）→ `file_exist=true` 即秒传完成
+  2. 取 `channel_list` 中第一个 `len>0` 的通道，传 `upload_key+channel_list快照+channel_id+ex+file_data(base64)`（分片请求中 block_sha_list 传空数组）
+  3. 响应 `upload_state`：1=继续 / 3=等待其他通道 / 2=完成；循环直到 2 或 file_exist
+- **retcode 50000**（服务繁忙）等 2~5 秒重试，最多 3 次
+- **QQ音乐云盘 = 微云根目录「QQ音乐」文件夹**（用户首次打开 App 云盘页时自动创建）；但 2026-10 实测 QQ音乐 App 不索引外部写入的文件，渠道搁置
+- MCP 已知坑：list 的 `dir_key` 才是查目录参数（pdir_key 会被忽略）；search 参数名是 `key`；move_file 用 `dst_pdir_key`；delete 需完整对象数组（beta 有 bug）
+
+---
+
+## 六、原则
 
 1. **零依赖是红线**：除非无法实现，否则不引入任何 npm 包
 2. **单文件是特色**：server.js 之外不新增 .js 源码文件
