@@ -1,0 +1,17 @@
+# 凭证文件 — 永远不要提交
+cookie.txt
+bilibili_cookie.txt
+
+# 临时/测试产物
+*.mp3
+*.m4a
+*_result.txt
+probe_*.txt
+eapi_*.txt
+upload_*.txt
+scan_result.txt
+verify_result.txt
+cloud_list_result.txt
+
+node_modules/
+.DS_Store
