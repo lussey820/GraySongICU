@@ -145,7 +145,7 @@ async function cloudDel(songId) {
 }
 
 // 上传一个音频文件(Buffer)到云盘, 返回 songId
-async function uploadBuffer({ buffer, ext, filename, song, artist, album, send }) {
+async function uploadBuffer({ buffer, ext, filename, song, artist, album, contentType, send }) {
   const md5 = crypto.createHash('md5').update(buffer).digest('hex');
   send(`预检中... (${(buffer.length / 1048576).toFixed(2)}MB, md5=${md5.slice(0, 8)}...)`);
   const check = await ncmReq('/api/cloud/upload/check', {
@@ -165,7 +165,7 @@ async function uploadBuffer({ buffer, ext, filename, song, artist, album, send }
     send('上传文件到云存储...');
     const lbs = JSON.parse((await req('GET', `https://wanproxy.127.net/lbs?version=1.0&bucketname=${BUCKET}`, {})).text);
     const upUrl = `${lbs.upload[0]}/${BUCKET}/${objectKey.replace(/\//g, '%2F')}?offset=0&complete=true&version=1.0`;
-    const up = await req('POST', upUrl, { 'x-nos-token': token, 'Content-MD5': md5, 'Content-Type': 'audio/mp4' }, buffer);
+    const up = await req('POST', upUrl, { 'x-nos-token': token, 'Content-MD5': md5, 'Content-Type': contentType || 'audio/mp4' }, buffer);
     if (up.status !== 200) throw new Error('云存储上传失败: ' + up.text.slice(0, 150));
     send('文件上传完成');
   }
@@ -175,7 +175,7 @@ async function uploadBuffer({ buffer, ext, filename, song, artist, album, send }
   let info = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
     info = await ncmReq('/api/upload/cloud/info/v2', {
-      md5, songid: check.songId, filename, song, album: album || 'Bilibili', artist, bitrate: '999000', resourceId,
+      md5, songid: check.songId, filename, song, album: album || '', artist, bitrate: '999000', resourceId,
     });
     if (info.code === 200) break;
     if (attempt === 1) {
@@ -217,7 +217,8 @@ async function downloadAudio(stream, headers, send) {
 // ---------- B站 ----------
 const QUALITY_IDS = { '192k': 30280, '132k': 30232, '64k': 30216 };
 function pickAudio(dash, quality) {
-  const audios = (dash.audio || []).slice().sort((a, b) => b.bandwidth - a.bandwidth);
+  // 30250=杜比全景声(ec-3), 云盘不支持, 直接排除
+  const audios = (dash.audio || []).filter(a => a.id !== 30250).slice().sort((a, b) => b.bandwidth - a.bandwidth);
   if (!audios.length) return null;
   if (!quality || quality === 'best') return { a: audios[0], downgraded: false };
   const want = QUALITY_IDS[quality];
@@ -227,6 +228,16 @@ function pickAudio(dash, quality) {
   const cap = audios.filter(a => a.id <= (want || 0));
   const chosen = cap.length ? cap[0] : audios[audios.length - 1];
   return { a: chosen, downgraded: true };
+}
+// 智能清洗歌名: 去序号前缀/【】[]标签, 拆"歌手-歌名"结构 (右段含版本词时不拆, 如"晴天-周杰伦版")
+function cleanSongName(raw) {
+  let s = String(raw || '').trim();
+  s = s.replace(/^[0-9]{1,4}[.、\-\s]+/, '').replace(/[【\[].*?[】\]]/g, '').replace(/\s{2,}/g, ' ').trim();
+  if (!s) return null;
+  const m = s.match(/^([^\-–—]{1,16}?)\s*[-–—]\s*(.{1,40})$/);
+  if (m && m[1].trim() && m[2].trim() && !/版|翻唱|伴奏|cover|live|remix|纯音乐|钢琴|八音盒|串烧|混剪|DJ/i.test(m[2].trim()))
+    return { song: m[2].trim(), artist: m[1].trim() };
+  return { song: s, artist: null };
 }
 async function biliHeaders() {
   const c = readBiliCookie();
@@ -269,12 +280,20 @@ async function biliUpload(input, opts, send) {
   send(`「${title}」 UP: ${owner.name} | 分P: ${allPages ? '全部 ' + pages.length + 'P' : targets[0].page + 'P'}`);
 
   const results = [];
+  const useClean = opts.clean !== false; // 智能清洗默认开启
   for (let i = 0; i < targets.length; i++) {
     const pg = targets[i];
-    // 歌名优先级: 用户指定 > 分P名(有意义时) > 视频标题
-    const partName = pg.part && pg.part !== title ? sanitize(pg.part) : null;
-    const songName = opts.song ? sanitize(opts.song) : (partName || sanitize(title));
-    const artist = sanitize(opts.artist || owner.name);
+    // 命名优先级: 手动指定 > (清洗开启时)清洗分P名 > 原始分P名 > 视频标题
+    const rawName = pg.part && pg.part !== title ? pg.part : title;
+    let songName, artist;
+    if (opts.song) {
+      songName = sanitize(opts.song);
+      artist = sanitize(opts.artist || owner.name);
+    } else {
+      const cleaned = useClean ? cleanSongName(rawName) : null;
+      songName = sanitize((cleaned && cleaned.song) || rawName);
+      artist = sanitize(opts.artist || (cleaned && cleaned.artist) || owner.name);
+    }
     if (i > 0) { send('风控保护: 等待5秒...'); await sleep(5000); }
     send(`\n=== [${i + 1}/${targets.length}] ${pg.part} ===`);
 
@@ -293,9 +312,11 @@ async function biliUpload(input, opts, send) {
       const buf = await downloadAudio(a, H, send);
       send(`已下载 ${(buf.length / 1048576).toFixed(2)}MB`);
 
+      // 30251=Hi-Res(FLAC), 其余为 AAC(m4a); 专辑不写(留空给网易云/后续手动匹配)
+      const ext = a.id === 30251 ? 'flac' : 'm4a';
       const songId = await uploadBuffer({
-        buffer: buf, ext: 'm4a', filename: songName + '.m4a',
-        song: songName, artist, album: 'Bilibili', send,
+        buffer: buf, ext, filename: songName + '.' + ext,
+        song: songName, artist, album: '', contentType: ext === 'flac' ? 'audio/flac' : 'audio/mp4', send,
       });
       results.push({ page: pg.page, song: songName, songId, ok: true });
       send(`✓ 完成 songId=${songId}`);
@@ -362,8 +383,9 @@ const PAGE = `<!DOCTYPE html>
     </div>
     <div class="row" style="margin-top:10px">
       <label class="chk"><input type="checkbox" id="allPages"> 上传全部分P</label>
-      <input type="text" id="song" placeholder="歌名(留空=标题)" style="max-width:220px" />
-      <input type="text" id="artist" placeholder="歌手(留空=UP主)" style="max-width:180px" />
+      <label class="chk" title="去序号/标签, 拆分'歌手-歌名', 歌手字段自动纠正"><input type="checkbox" id="clean" checked> 智能清洗歌名</label>
+      <input type="text" id="song" placeholder="歌名(留空=自动)" style="max-width:200px" />
+      <input type="text" id="artist" placeholder="歌手(留空=自动)" style="max-width:160px" />
       <button id="go" onclick="doUpload()">上传</button>
     </div>
     <div id="log"></div>
@@ -446,6 +468,7 @@ async function doUpload() {
     const res = await fetch('/api/upload', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ input, quality: document.getElementById('quality').value,
         allPages: document.getElementById('allPages').checked,
+        clean: document.getElementById('clean').checked,
         song: document.getElementById('song').value.trim(), artist: document.getElementById('artist').value.trim() }) });
     const reader = res.body.getReader();
     const dec = new TextDecoder();
