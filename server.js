@@ -171,14 +171,30 @@ async function uploadBuffer({ buffer, ext, filename, song, artist, album, send }
   }
 
   send('写入歌曲信息...');
-  const info = await ncmReq('/api/upload/cloud/info/v2', {
-    md5, songid: check.songId, filename, song, album: album || 'Bilibili', artist, bitrate: '999000', resourceId,
-  });
+  // 入库偶发失败(频率限制 uploadStatus:9 / 存储同步延迟), 重试一次
+  let info = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    info = await ncmReq('/api/upload/cloud/info/v2', {
+      md5, songid: check.songId, filename, song, album: album || 'Bilibili', artist, bitrate: '999000', resourceId,
+    });
+    if (info.code === 200) break;
+    if (attempt === 1) {
+      send(`入库失败, 5秒后重试: ${JSON.stringify(info).slice(0, 120)}`);
+      await sleep(5000);
+    }
+  }
   if (info.code !== 200) throw new Error('入库失败: ' + JSON.stringify(info).slice(0, 200));
 
   send('发布...');
   const pub = await ncmReq('/api/cloud/pub/v2', { songid: info.songId });
-  if (pub.code !== 200) throw new Error('发布失败: ' + JSON.stringify(pub).slice(0, 150));
+  if (pub.code !== 200) {
+    // 重复上传场景: 歌曲已在云盘且已发布, pub 会失败但返回歌曲信息 — 视为已存在
+    if (pub.privateCloud && pub.privateCloud.simpleSong) {
+      send('歌曲已在云盘中, 跳过重复发布');
+    } else {
+      throw new Error('发布失败: ' + JSON.stringify(pub).slice(0, 150));
+    }
+  }
   return info.songId;
 }
 
@@ -239,41 +255,58 @@ async function biliUpload(input, opts, send) {
   if (view.code !== 0) throw new Error('B站视频信息获取失败: ' + view.message);
   const { title, owner, pages } = view.data;
 
+  // 防御: B站对未登录请求偶发截断 pages 列表 (实测: 2P视频返回1P)
+  const declared = view.data.videos || pages.length;
+  if (declared > pages.length) {
+    send(`⚠ B站返回分P列表不完整 (${pages.length}/${declared}P), "全部分P"模式可能漏传. 在页面配置B站cookie可改善`);
+  }
+
   let targets = pages;
   if (!allPages) {
     targets = page ? pages.filter(p => p.page === page) : [pages[0]];
-    if (!targets.length) throw new Error('未找到分P ' + page);
+    if (!targets.length) throw new Error(`未找到分P ${page} (接口返回了 ${pages.length}P${declared > pages.length ? ', 且列表不完整' : ''})`);
   }
   send(`「${title}」 UP: ${owner.name} | 分P: ${allPages ? '全部 ' + pages.length + 'P' : targets[0].page + 'P'}`);
 
   const results = [];
   for (let i = 0; i < targets.length; i++) {
     const pg = targets[i];
-    const songName = sanitize(targets.length > 1 ? `${pg.part}` : (opts.song || title));
+    // 歌名优先级: 用户指定 > 分P名(有意义时) > 视频标题
+    const partName = pg.part && pg.part !== title ? sanitize(pg.part) : null;
+    const songName = opts.song ? sanitize(opts.song) : (partName || sanitize(title));
     const artist = sanitize(opts.artist || owner.name);
-    if (targets.length > 1 && i > 0) { send('风控保护: 等待2秒...'); await sleep(2000); }
+    if (i > 0) { send('风控保护: 等待5秒...'); await sleep(5000); }
     send(`\n=== [${i + 1}/${targets.length}] ${pg.part} ===`);
 
-    send('获取音频流(音质: ' + (quality === 'best' ? '最高' : quality) + ')...');
-    const play = await getJSON(`https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${pg.cid}&fnval=16&fnver=0&qn=0`, H);
-    if (play.code !== 0 || !play.data.dash) throw new Error('playurl失败: ' + (play.message || '无DASH流'));
-    const { a, downgraded } = pickAudio(play.data.dash, quality);
-    if (!a) throw new Error('无音频流');
-    if (downgraded) send(`目标音质不可用, 已降级到 ${Math.round(a.bandwidth / 1000)}kbps (id=${a.id})`);
-    else send(`选中 ${Math.round(a.bandwidth / 1000)}kbps (id=${a.id})`);
-    if (!readBiliCookie() && a.id <= QUALITY_IDS['64k']) send('[提示] 未配置B站cookie, 音质受限. 页面设置中可粘贴SESSDATA提升音质');
+    // 单P失败不中断批量, 最后汇总
+    try {
+      send('获取音频流(音质: ' + (quality === 'best' ? '最高' : quality) + ')...');
+      const play = await getJSON(`https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${pg.cid}&fnval=16&fnver=0&qn=0`, H);
+      if (play.code !== 0 || !play.data.dash) throw new Error('playurl失败: ' + (play.message || '无DASH流'));
+      const { a, downgraded } = pickAudio(play.data.dash, quality);
+      if (!a) throw new Error('无音频流');
+      if (downgraded) send(`目标音质不可用, 已降级到 ${Math.round(a.bandwidth / 1000)}kbps (id=${a.id})`);
+      else send(`选中 ${Math.round(a.bandwidth / 1000)}kbps (id=${a.id})`);
+      if (!readBiliCookie() && a.id <= QUALITY_IDS['64k']) send('[提示] 未配置B站cookie, 音质受限. 页面设置中可粘贴SESSDATA提升音质');
 
-    send('下载音频中...');
-    const buf = await downloadAudio(a, H, send);
-    send(`已下载 ${(buf.length / 1048576).toFixed(2)}MB`);
+      send('下载音频中...');
+      const buf = await downloadAudio(a, H, send);
+      send(`已下载 ${(buf.length / 1048576).toFixed(2)}MB`);
 
-    const songId = await uploadBuffer({
-      buffer: buf, ext: 'm4a', filename: songName + '.m4a',
-      song: songName, artist, album: 'Bilibili', send,
-    });
-    results.push({ page: pg.page, song: songName, songId });
-    send(`✓ 完成 songId=${songId}`);
+      const songId = await uploadBuffer({
+        buffer: buf, ext: 'm4a', filename: songName + '.m4a',
+        song: songName, artist, album: 'Bilibili', send,
+      });
+      results.push({ page: pg.page, song: songName, songId, ok: true });
+      send(`✓ 完成 songId=${songId}`);
+    } catch (e) {
+      send(`✗ 本P失败: ${e.message}`);
+      results.push({ page: pg.page, song: songName, ok: false, error: e.message });
+    }
   }
+
+  const okCount = results.filter(r => r.ok).length;
+  send(`\n===== 汇总: 成功 ${okCount}/${targets.length} =====`);
   return results;
 }
 
@@ -509,7 +542,8 @@ http.createServer((rq, rs) => {
     rq.on('data', d => body += d);
     rq.on('end', async () => {
       rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      const send = msg => rs.write(JSON.stringify({ type: 'log', msg }) + '\n');
+      // 客户端可能中途断开(关浏览器/超时), 上传任务需继续跑完, 写日志失败必须静默
+      const send = msg => { try { rs.write(JSON.stringify({ type: 'log', msg }) + '\n'); } catch (e) {} };
       try {
         const opts = JSON.parse(body);
         const results = await biliUpload(opts.input, opts, send);
