@@ -68,6 +68,19 @@ function sanitize(s) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// ---------- 上传历史 (防重复参考, 本地 history.json, 不进 git) ----------
+const HISTORY_FILE = path.join(DIR, 'history.json');
+function readHistory() {
+  try { return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); } catch (e) { return []; }
+}
+function appendHistory(entry) {
+  try {
+    const list = readHistory();
+    list.unshift({ time: new Date().toISOString().replace('T', ' ').slice(0, 19), ...entry });
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(list.slice(0, 500), null, 2));
+  } catch (e) { /* 历史写失败不影响上传 */ }
+}
+
 // ---------- 网易云 eapi ----------
 function aesEcb(buf, key) {
   const c = crypto.createCipheriv('aes-128-ecb', key, null);
@@ -108,7 +121,15 @@ function ncmReq(apiPath, data) {
             text = Buffer.concat([d.update(buf), d.final()]).toString('utf8');
           } catch (e) { /* keep */ }
         }
-        try { resolve(JSON.parse(text)); } catch (e) { reject(new Error('非JSON: ' + text.slice(0, 100))); }
+        let j;
+        try { j = JSON.parse(text); } catch (e) { return reject(new Error('非JSON: ' + text.slice(0, 100))); }
+        // code 301 = 登录失效: 明确中断, 避免半成品 (文件已传存储但无法入库)
+        if (j.code === 301) {
+          const err = new Error('网易云登录已失效(301): MUSIC_U 过期或无效, 请在页面设置中重新粘贴');
+          err.authFail = true;
+          return reject(err);
+        }
+        resolve(j);
       });
     });
     r.on('error', reject);
@@ -119,9 +140,11 @@ function ncmReq(apiPath, data) {
 
 // ---------- 网易云云盘操作 ----------
 async function ncmAccount() {
-  const j = await ncmReq('/api/nuser/account/get', {});
-  if (j.code === 200 && j.profile) return { ok: true, nickname: j.profile.nickname, userId: j.account.id };
-  return { ok: false };
+  try {
+    const j = await ncmReq('/api/nuser/account/get', {});
+    if (j.code === 200 && j.profile) return { ok: true, nickname: j.profile.nickname, userId: j.account.id };
+    return { ok: false };
+  } catch (e) { return { ok: false }; }
 }
 async function cloudList() {
   const list = await ncmReq('/api/v1/cloud/get', { limit: 50, offset: 0, e_r: true });
@@ -297,10 +320,14 @@ async function biliUpload(input, opts, send) {
     if (i > 0) { send('风控保护: 等待5秒...'); await sleep(5000); }
     send(`\n=== [${i + 1}/${targets.length}] ${pg.part} ===`);
 
-    // 单P失败不中断批量, 最后汇总
+    // 单P失败不中断批量, 最后汇总; 登录失效类错误则提前终止
     try {
+      const prev = readHistory().find(h => h.bvid === bvid && h.page === pg.page);
+      if (prev) send(`[提示] 该分P曾于 ${prev.time} 上传过 (songId=${prev.songId}), 重复内容会被云盘秒传合并`);
+
       send('获取音频流(音质: ' + (quality === 'best' ? '最高' : quality) + ')...');
       const play = await getJSON(`https://api.bilibili.com/x/player/playurl?bvid=${bvid}&cid=${pg.cid}&fnval=16&fnver=0&qn=0`, H);
+      if (play.code === -101) throw new Error('B站登录已失效(-101): SESSDATA 过期或无效, 请在页面设置中更新或清空');
       if (play.code !== 0 || !play.data.dash) throw new Error('playurl失败: ' + (play.message || '无DASH流'));
       const { a, downgraded } = pickAudio(play.data.dash, quality);
       if (!a) throw new Error('无音频流');
@@ -320,9 +347,12 @@ async function biliUpload(input, opts, send) {
       });
       results.push({ page: pg.page, song: songName, songId, ok: true });
       send(`✓ 完成 songId=${songId}`);
+      appendHistory({ bvid, page: pg.page, song: songName, artist, songId, size: buf.length });
     } catch (e) {
       send(`✗ 本P失败: ${e.message}`);
       results.push({ page: pg.page, song: songName, ok: false, error: e.message });
+      // 登录失效: 后续每P必然同样失败, 提前终止
+      if (e.authFail || /-101/.test(e.message)) { send('登录已失效, 终止剩余分P'); break; }
     }
   }
 
@@ -414,6 +444,14 @@ const PAGE = `<!DOCTYPE html>
     <tbody id="list"><tr><td colspan="5" class="empty">加载中...</td></tr></tbody></table>
   </div>
 
+  <details class="card">
+    <summary style="cursor:pointer;color:#f8bbd0;font-size:14px;">上传历史 (最近50条, 本地记录)</summary>
+    <div style="margin-top:12px;">
+      <table><thead><tr><th>时间</th><th style="width:34%">歌曲</th><th>来源</th><th>大小</th></tr></thead>
+      <tbody id="history"><tr><td colspan="4" class="empty">暂无记录</td></tr></tbody></table>
+    </div>
+  </details>
+
   <div class="disclaimer">
     免责声明: 本工具仅供技术学习与个人使用, 上传至云盘的内容仅限本人收听。<br>
     请遵守B站、网易云音乐服务条款及相关版权法规, 请勿用于商业用途。使用者自行承担使用责任。
@@ -441,6 +479,14 @@ async function saveCookie(kind) {
   const r = await (await fetch('/api/cookie', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({kind, value:v}) })).json();
   if (r.ok) { log('✓ cookie已保存', 'ok'); loadStatus(); if (kind==='ncm') loadList(); }
   else log('✗ 保存失败: ' + r.error, 'err');
+}
+async function loadHistory() {
+  const j = await (await fetch('/api/history')).json();
+  const tb = document.getElementById('history');
+  if (!j.items.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">暂无记录</td></tr>'; return; }
+  tb.innerHTML = j.items.map(h =>
+    '<tr><td style="color:#888;white-space:nowrap">' + esc(h.time) + '</td><td>' + esc(h.song) + '</td><td>'
+    + esc(h.bvid + '?p=' + h.page) + '</td><td>' + (h.size ? (h.size/1048576).toFixed(1)+'MB' : '-') + '</td></tr>').join('');
 }
 async function loadList() {
   const j = await (await fetch('/api/list')).json();
@@ -482,7 +528,7 @@ async function doUpload() {
       for (const l of lines) {
         if (!l.trim()) continue;
         const j = JSON.parse(l);
-        if (j.type === 'done') { log('✓ 全部完成: ' + j.results.map(r => r.song + '(id=' + r.songId + ')').join(', '), 'ok'); loadList(); }
+        if (j.type === 'done') { log('✓ 全部完成: ' + j.results.map(r => r.song + '(id=' + r.songId + ')').join(', '), 'ok'); loadList(); loadHistory(); }
         else if (j.type === 'error') log('✗ ' + j.msg, 'err');
         else log(j.msg);
       }
@@ -490,7 +536,7 @@ async function doUpload() {
   } catch (e) { log('✗ ' + e.message, 'err'); }
   btn.disabled = false; btn.textContent = '上传';
 }
-loadStatus(); loadList();
+loadStatus(); loadList(); loadHistory();
 </script>
 </body>
 </html>`;
@@ -542,6 +588,11 @@ http.createServer((rq, rs) => {
       rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       rs.end(JSON.stringify({ count: 0, size: 0, songs: [], error: e.message }));
     });
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/history') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    rs.end(JSON.stringify({ items: readHistory().slice(0, 50) }));
     return;
   }
   if (rq.method === 'POST' && url === '/api/del') {
