@@ -182,6 +182,22 @@ async function uploadBuffer({ buffer, ext, filename, song, artist, album, send }
   return info.songId;
 }
 
+// 下载音频流: baseUrl 失败自动切换 backup_url (CDN 故障转移)
+async function downloadAudio(stream, headers, send) {
+  const urls = [stream.baseUrl, ...(stream.backup_url || [])].filter(Boolean);
+  let lastErr;
+  for (let i = 0; i < urls.length; i++) {
+    try {
+      if (urls.length > 1) send(`下载源 ${i + 1}/${urls.length}: ${new URL(urls[i]).hostname}`);
+      return await req('GET', urls[i], headers, null, true);
+    } catch (e) {
+      lastErr = e;
+      send(`  ✗ 源 ${i + 1} 连接失败: ${e.message}, 尝试备用源...`);
+    }
+  }
+  throw new Error('所有下载源均失败: ' + (lastErr ? lastErr.message : '未知'));
+}
+
 // ---------- B站 ----------
 const QUALITY_IDS = { '192k': 30280, '132k': 30232, '64k': 30216 };
 function pickAudio(dash, quality) {
@@ -245,10 +261,10 @@ async function biliUpload(input, opts, send) {
     if (!a) throw new Error('无音频流');
     if (downgraded) send(`目标音质不可用, 已降级到 ${Math.round(a.bandwidth / 1000)}kbps (id=${a.id})`);
     else send(`选中 ${Math.round(a.bandwidth / 1000)}kbps (id=${a.id})`);
-    if (!readBiliCookie()) send('[提示] 未配置B站cookie, 最高仅64kbps. 页面设置中可粘贴SESSDATA提升音质');
+    if (!readBiliCookie() && a.id <= QUALITY_IDS['64k']) send('[提示] 未配置B站cookie, 音质受限. 页面设置中可粘贴SESSDATA提升音质');
 
     send('下载音频中...');
-    const buf = await req('GET', a.baseUrl, H, null, true);
+    const buf = await downloadAudio(a, H, send);
     send(`已下载 ${(buf.length / 1048576).toFixed(2)}MB`);
 
     const songId = await uploadBuffer({
