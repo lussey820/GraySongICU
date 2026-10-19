@@ -295,12 +295,18 @@ async function biliUpload(input, opts, send) {
     send(`⚠ B站返回分P列表不完整 (${pages.length}/${declared}P), "全部分P"模式可能漏传. 在页面配置B站cookie可改善`);
   }
 
+  // 目标分P: 优先 pages 数组(任意范围), 其次 allPages, 最后单P/首个
   let targets = pages;
-  if (!allPages) {
+  const wantPages = Array.isArray(opts.pages) && opts.pages.length ? opts.pages.map(Number) : null;
+  if (wantPages) {
+    const want = new Set(wantPages);
+    targets = pages.filter(p => want.has(p.page));
+    if (!targets.length) throw new Error(`指定的分P ${wantPages.join(',')} 不存在 (接口返回了 ${pages.length}P${declared > pages.length ? ', 且列表不完整' : ''})`);
+  } else if (!allPages) {
     targets = page ? pages.filter(p => p.page === page) : [pages[0]];
     if (!targets.length) throw new Error(`未找到分P ${page} (接口返回了 ${pages.length}P${declared > pages.length ? ', 且列表不完整' : ''})`);
   }
-  send(`「${title}」 UP: ${owner.name} | 分P: ${allPages ? '全部 ' + pages.length + 'P' : targets[0].page + 'P'}`);
+  send(`「${title}」 UP: ${owner.name} | 分P: ${allPages ? '全部 ' + pages.length + 'P' : wantPages ? '指定 ' + targets.length + 'P' : targets[0].page + 'P'}`);
 
   const results = [];
   const useClean = opts.clean !== false; // 智能清洗默认开启
@@ -369,153 +375,299 @@ const PAGE = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>bili2ncm — B站音频传网易云云盘</title>
 <style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:"Segoe UI","Microsoft YaHei",sans-serif; background:linear-gradient(135deg,#0f0c29,#302b63,#24243e); min-height:100vh; color:#eee; padding:30px 16px; }
-  .wrap { max-width:780px; margin:0 auto; }
-  h1 { font-size:22px; margin-bottom:6px; } h1 span{ color:#ec407a; }
-  .sub { color:#aaa; font-size:13px; margin-bottom:22px; line-height:1.6; }
-  .card { background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.1); border-radius:14px; padding:20px; margin-bottom:18px; }
-  .card h3 { font-size:14px; margin-bottom:12px; color:#f8bbd0; }
-  .row { display:flex; gap:10px; flex-wrap:wrap; }
-  input[type=text],input[type=password],select { flex:1; min-width:160px; padding:11px 13px; border-radius:10px; border:1px solid rgba(255,255,255,.15); background:rgba(0,0,0,.3); color:#fff; font-size:13.5px; outline:none; }
-  input:focus,select:focus { border-color:#ec407a; }
-  select { cursor:pointer; }
-  button { padding:11px 20px; border:none; border-radius:10px; background:linear-gradient(135deg,#ec407a,#ff6d00); color:#fff; font-size:14px; cursor:pointer; white-space:nowrap; }
-  button:disabled { opacity:.5; cursor:not-allowed; }
-  button.ghost { background:rgba(255,255,255,.12); font-size:12.5px; padding:8px 14px; }
-  label.chk { display:inline-flex; align-items:center; gap:6px; font-size:13px; color:#ccc; cursor:pointer; }
-  .hint { font-size:12px; color:#888; margin-top:8px; line-height:1.6; }
-  .ok { color:#69f0ae; } .bad { color:#ff8a80; }
-  #log { margin-top:14px; background:rgba(0,0,0,.35); border-radius:10px; padding:12px; font-family:Consolas,monospace; font-size:12.5px; max-height:240px; overflow-y:auto; white-space:pre-wrap; color:#9fdca4; display:none; }
-  .stats { color:#aaa; font-size:12.5px; margin-bottom:10px; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th { text-align:left; color:#bbb; font-weight:normal; padding:6px 8px; border-bottom:1px solid rgba(255,255,255,.12); }
-  td { padding:8px; border-bottom:1px solid rgba(255,255,255,.06); }
-  .del { color:#ff8a80; cursor:pointer; font-size:12px; }
-  .empty { color:#888; text-align:center; padding:18px; }
-  .disclaimer { font-size:11.5px; color:#777; line-height:1.7; margin-top:20px; text-align:center; }
+  :root{ --red:#ec4141; --red-dark:#d63a3a; --bg:#f6f6f8; --card:#fff; --line:#ebebef; --line-soft:#f2f2f5; --t1:#1f1f22; --t2:#6b6b72; --t3:#9b9ba2; --ok:#2bb673; --bad:#d5453c; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  [hidden]{display:none !important}
+  body{background:var(--bg);color:var(--t1);font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+  input,select,button{font-family:inherit}
+  :focus-visible{outline:2px solid var(--red);outline-offset:2px;border-radius:4px}
+
+  .top{background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  .top-in{max-width:720px;margin:0 auto;height:56px;padding:0 16px;display:flex;align-items:center;justify-content:space-between}
+  .brand{font-size:15px;font-weight:600;letter-spacing:.2px}
+  .account{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--t2)}
+  .dot{width:7px;height:7px;border-radius:50%;background:#c9c9cf}
+  .dot.on{background:var(--ok)} .dot.off{background:var(--bad)}
+  .account b{color:var(--t1);font-weight:500}
+  .link{background:none;border:none;color:var(--t3);font-size:13px;cursor:pointer;padding:10px 4px}
+  .link:hover{color:var(--red)}
+
+  main{max-width:720px;margin:0 auto;padding:20px 16px 40px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px}
+  .card h2{font-size:15px;font-weight:600}
+
+  .upload{display:flex;gap:10px}
+  .upload input[type=text]{flex:1;min-width:0;height:44px;padding:0 12px;border:1px solid #e3e3e9;border-radius:8px;background:#fff;font-size:14px;color:var(--t1);outline:none;transition:border-color .15s}
+  .upload input::placeholder{color:#b0b0b8}
+  .upload input:focus{border-color:var(--red)}
+  .upload select{width:126px;height:44px;padding:0 10px;border:1px solid #e3e3e9;border-radius:8px;background:#fff;font-size:13px;color:var(--t1);outline:none;cursor:pointer}
+  .btn{height:44px;padding:0 26px;border:none;border-radius:8px;background:var(--red);color:#fff;font-size:14px;font-weight:500;cursor:pointer;transition:background .15s}
+  .btn:hover{background:var(--red-dark)}
+  .btn:disabled{background:#f0b3b3;cursor:default}
+
+  .sub{margin-top:12px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  .sub input[type=text]{width:170px;height:40px;padding:0 10px;border:1px solid #e3e3e9;border-radius:7px;background:#fff;font-size:13px;color:var(--t1);outline:none}
+  .sub input[type=text]:focus{border-color:var(--red)}
+  .chk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--t2);cursor:pointer;user-select:none;padding:10px 0}
+  .chk input{width:15px;height:15px;accent-color:var(--red);cursor:pointer}
+  .more{display:none;margin-top:10px;gap:10px;flex-wrap:wrap}
+  .more.open{display:flex}
+  .more input{flex:1;min-width:140px;height:40px;padding:0 10px;border:1px solid #e3e3e9;border-radius:7px;font-size:13px;outline:none}
+  .more input:focus{border-color:var(--red)}
+
+  .panel{margin-top:14px;display:none;gap:10px;flex-direction:column}
+  .panel.open{display:flex}
+  .panel .crow{display:flex;gap:10px}
+  .panel input{flex:1;min-width:0;height:40px;padding:0 10px;border:1px solid #e3e3e9;border-radius:7px;font-size:13px;outline:none}
+  .panel input:focus{border-color:var(--red)}
+  .mini{background:#fff;border:1px solid var(--line);border-radius:7px;padding:9px 14px;font-size:12.5px;color:var(--t2);cursor:pointer}
+  .mini:hover{color:var(--red);border-color:#f3c9c9}
+
+  .progress{margin-top:14px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px 20px}
+  .p-top{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px}
+  .p-title{font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .p-count{font-size:13px;color:var(--t2);font-variant-numeric:tabular-nums;flex:none;margin-left:12px}
+  .bar{height:4px;background:#f1f1f4;border-radius:2px;overflow:hidden}
+  .bar i{display:block;height:100%;width:0;background:var(--red);border-radius:2px;transition:width .35s ease}
+  .p-now{margin-top:12px;font-size:13px;color:var(--t2)}
+  .p-now b{color:var(--t1);font-weight:500}
+  .p-errs{margin-top:10px;font-size:12.5px;color:var(--bad);line-height:1.7;white-space:pre-wrap}
+  .p-done{display:flex;align-items:center;justify-content:space-between}
+  .p-done p{font-size:13px;color:var(--t1)}
+  .p-done p span{color:var(--t3);font-size:12px;margin-left:6px}
+  details.rawlog{margin-top:10px}
+  details.rawlog summary{font-size:12px;color:var(--t3);cursor:pointer}
+  details.rawlog pre{margin-top:8px;background:#fafafc;border:1px solid var(--line-soft);border-radius:8px;padding:10px;font:12px/1.7 Consolas,monospace;color:var(--t2);max-height:180px;overflow:auto;white-space:pre-wrap}
+
+  .cloud{margin-top:14px}
+  .cloud-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px}
+  .cloud-right{display:flex;align-items:center;gap:12px}
+  .cloud-meta{font-size:12px;color:var(--t3);font-variant-numeric:tabular-nums}
+  .song{display:grid;grid-template-columns:1fr 1fr 108px 40px;grid-template-areas:"name artist meta del";align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line-soft);font-size:13px}
+  .s-name{grid-area:name;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .s-artist{grid-area:artist;min-width:0;color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .s-meta{grid-area:meta;color:var(--t3);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .s-del{grid-area:del;background:none;border:none;font-size:13px;color:var(--t3);cursor:pointer;text-align:right;padding:8px 0}
+  .s-del:hover{color:var(--red)}
+  .empty{padding:34px 0 30px;text-align:center;color:var(--t3);font-size:13px;border-top:1px solid var(--line-soft)}
+  .empty button{background:none;border:none;color:var(--red);font-size:13px;cursor:pointer;padding:8px}
+
+  .hist{margin-top:14px}
+  .hist summary{font-size:13px;color:var(--t2);cursor:pointer;padding:12px 0}
+  .h-row{display:flex;gap:12px;padding:9px 0;border-top:1px solid var(--line-soft);font-size:12.5px;color:var(--t2);align-items:baseline}
+  .h-time{flex:none;color:var(--t3);font-variant-numeric:tabular-nums}
+  .h-name{flex:1;min-width:0;color:var(--t1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .h-size{flex:none;color:var(--t3)}
+
+  .foot{margin-top:18px;text-align:center;font-size:12px;color:#b6b6bd;line-height:1.8}
+
+  @media (max-width:560px){
+    .upload{flex-wrap:wrap}
+    .upload input[type=text]{flex:1 1 100%}
+    .upload select{flex:1;width:auto}
+    .btn{flex:none;padding:0 22px}
+    .song{grid-template-columns:1fr auto;grid-template-areas:"name del" "artist del";row-gap:2px}
+    .s-meta{display:none}
+    .panel .crow{flex-wrap:wrap}
+    .panel input{flex:1 1 100%}
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>bili2ncm <span>→</span> 网易云音乐云盘</h1>
-  <div class="sub">单文件 · 零依赖 · 基于客户端 eapi 协议<br>粘贴B站视频链接或BV号, 提取音频并上传到你的音乐云盘</div>
 
-  <div class="card">
-    <div class="row">
-      <input type="text" id="input" placeholder="BV1xxx... 或 https://www.bilibili.com/video/BVxxx?p=2" style="flex:2" />
+<div class="top">
+  <div class="top-in">
+    <div class="brand">bili2ncm</div>
+    <div class="account" id="account"><span class="dot"></span>检测登录态...</div>
+  </div>
+</div>
+
+<main>
+  <section class="card">
+    <div class="upload">
+      <input type="text" id="input" placeholder="粘贴 B 站视频链接或 BV 号">
       <select id="quality">
         <option value="best">最高音质</option>
         <option value="192k">192kbps</option>
         <option value="132k">132kbps</option>
         <option value="64k">64kbps</option>
       </select>
+      <button class="btn" id="go" onclick="doUpload()">上传</button>
     </div>
-    <div class="row" style="margin-top:10px">
-      <label class="chk"><input type="checkbox" id="allPages"> 上传全部分P</label>
-      <label class="chk" title="去序号/标签, 拆分'歌手-歌名', 歌手字段自动纠正"><input type="checkbox" id="clean" checked> 智能清洗歌名</label>
-      <input type="text" id="song" placeholder="歌名(留空=自动)" style="max-width:200px" />
-      <input type="text" id="artist" placeholder="歌手(留空=自动)" style="max-width:160px" />
-      <button id="go" onclick="doUpload()">上传</button>
+    <div class="sub">
+      <input type="text" id="pages" placeholder="分P，如 2 或 1-47">
+      <label class="chk"><input type="checkbox" id="allPages">上传全部</label>
+      <label class="chk" title="去序号/标签, 拆分'歌手-歌名', 歌手字段自动纠正"><input type="checkbox" id="clean" checked>整理歌名</label>
+      <button class="link" onclick="toggleMore()" type="button">手动指定歌名</button>
     </div>
-    <div id="log"></div>
-  </div>
+    <div class="more" id="more">
+      <input type="text" id="song" placeholder="歌名 (留空=自动)">
+      <input type="text" id="artist" placeholder="歌手 (留空=自动)">
+    </div>
+  </section>
 
-  <div class="card">
-    <h3>设置</h3>
-    <div class="row" style="margin-bottom:10px">
-      <input type="password" id="ncmCookie" placeholder="网易云 MUSIC_U=F90E1F... (多个cookie分号连接)" />
-      <button class="ghost" onclick="saveCookie('ncm')">保存网易云</button>
+  <section class="card panel" id="settings">
+    <div class="crow">
+      <input type="password" id="ncmCookie" placeholder="网易云 MUSIC_U=F90E1F... (多个cookie分号连接)">
+      <button class="mini" onclick="saveCookie('ncm')">保存网易云</button>
     </div>
-    <div class="row">
-      <input type="password" id="biliCookie" placeholder="B站 SESSDATA=xxx (可选, 提升音质上限)" />
-      <button class="ghost" onclick="saveCookie('bili')">保存B站</button>
+    <div class="crow">
+      <input type="password" id="biliCookie" placeholder="B站 SESSDATA=xxx (可选, 提升音质上限)">
+      <button class="mini" onclick="saveCookie('bili')">保存B站</button>
     </div>
-    <div class="hint" id="status">加载中...</div>
-  </div>
+  </section>
 
-  <div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-      <h3 style="margin:0">我的音乐云盘</h3>
-      <button class="ghost" onclick="loadList()">刷新</button>
+  <section class="progress" id="progress" hidden>
+    <div id="running">
+      <div class="p-top">
+        <span class="p-title" id="pTitle">正在上传</span>
+        <span class="p-count" id="pCount"></span>
+      </div>
+      <div class="bar"><i id="pBar"></i></div>
+      <div class="p-now" id="pNow">准备中</div>
+      <div class="p-errs" id="pErrs" hidden></div>
+      <details class="rawlog" id="rawlogWrap"><summary>详细日志</summary><pre id="rawlog"></pre></details>
     </div>
-    <div class="stats" id="stats"></div>
-    <table><thead><tr><th style="width:42%">歌曲</th><th>歌手</th><th>音质</th><th>大小</th><th></th></tr></thead>
-    <tbody id="list"><tr><td colspan="5" class="empty">加载中...</td></tr></tbody></table>
-  </div>
+    <div class="p-done" id="finished" hidden>
+      <p id="pDone">上传完成</p>
+      <button class="link" onclick="document.getElementById('progress').hidden=true">收起</button>
+    </div>
+  </section>
 
-  <details class="card">
-    <summary style="cursor:pointer;color:#f8bbd0;font-size:14px;">上传历史 (最近50条, 本地记录)</summary>
-    <div style="margin-top:12px;">
-      <table><thead><tr><th>时间</th><th style="width:34%">歌曲</th><th>来源</th><th>大小</th></tr></thead>
-      <tbody id="history"><tr><td colspan="4" class="empty">暂无记录</td></tr></tbody></table>
+  <section class="card cloud">
+    <div class="cloud-head">
+      <h2>音乐云盘</h2>
+      <div class="cloud-right">
+        <span class="cloud-meta" id="stats"></span>
+        <button class="mini" onclick="loadList()">刷新</button>
+      </div>
     </div>
+    <div id="list"></div>
+  </section>
+
+  <details class="card hist">
+    <summary>上传历史 (本地记录, 最近50条)</summary>
+    <div id="history"></div>
   </details>
 
-  <div class="disclaimer">
-    免责声明: 本工具仅供技术学习与个人使用, 上传至云盘的内容仅限本人收听。<br>
-    请遵守B站、网易云音乐服务条款及相关版权法规, 请勿用于商业用途。使用者自行承担使用责任。
-  </div>
-</div>
+  <p class="foot">免责声明: 上传内容仅限本人收听, 请遵守B站与网易云音乐的服务条款及版权法规, 请勿用于商业用途。</p>
+</main>
 <script>
 function esc(s){ return String(s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function log(msg, cls) {
-  const el = document.getElementById('log');
-  el.style.display = 'block';
-  const line = document.createElement('div');
-  if (cls) line.className = cls;
-  line.textContent = msg;
-  el.appendChild(line);
-  el.scrollTop = el.scrollHeight;
+const $ = id => document.getElementById(id);
+function toggleSettings(){ $('settings').classList.toggle('open'); }
+function toggleMore(){ $('more').classList.toggle('open'); }
+function focusInput(){ $('input').focus(); }
+
+// 日志流: 全文进「详细日志」, 简短一行进 pNow, 错误行进 pErrs (错误态常驻可见)
+function step(msg, isErr) {
+  const pre = $('rawlog');
+  pre.textContent += msg + '\\n';
+  pre.scrollTop = pre.scrollHeight;
+  if (isErr) {
+    const eb = $('pErrs');
+    eb.hidden = false;
+    eb.textContent = (eb.textContent ? eb.textContent + '\\n' : '') + msg;
+    return;
+  }
+  const short = msg.length > 66 ? msg.slice(0, 66) + '…' : msg;
+  $('pNow').innerHTML = '<b>' + esc(short) + '</b>';
+}
+let lastTotal = 0;
+function setBar(n, total) {
+  $('pCount').textContent = total > 1 ? n + ' / ' + total : '';
+  $('pBar').style.width = Math.max(3, Math.round(n / total * 100)) + '%';
+}
+// 单P任务无 [n/m] 行, 按阶段推进进度条
+function phaseBar(msg) {
+  if (lastTotal) return;
+  const w = $('pBar');
+  if (msg.indexOf('获取音频流') > -1) w.style.width = '12%';
+  else if (msg.indexOf('下载音频') > -1) w.style.width = '32%';
+  else if (msg.indexOf('上传文件到云存储') > -1) w.style.width = '62%';
+  else if (msg.indexOf('写入歌曲信息') > -1) w.style.width = '82%';
+  else if (msg.indexOf('发布') > -1) w.style.width = '92%';
+  else if (msg.indexOf('✓ 完成') > -1) w.style.width = '100%';
 }
 async function loadStatus() {
   const j = await (await fetch('/api/status')).json();
-  document.getElementById('status').innerHTML =
-    '网易云: ' + (j.ncm.ok ? '<span class=ok>已登录 (' + esc(j.ncm.nickname) + ')</span>' : '<span class=bad>未配置/失效, 请粘贴MUSIC_U</span>')
-    + ' &nbsp;|&nbsp; B站: ' + (j.bili ? '<span class=ok>已配置 (高音质)</span>' : '未配置 (仅64kbps)');
+  const el = $('account');
+  if (j.ncm.ok) el.innerHTML = '<span class="dot on"></span>网易云 · <b>' + esc(j.ncm.nickname) + '</b><button class="link" onclick="toggleSettings()">设置</button>';
+  else el.innerHTML = '<span class="dot off"></span>网易云未登录<button class="link" onclick="toggleSettings()">去配置</button>';
 }
 async function saveCookie(kind) {
-  const v = kind === 'ncm' ? document.getElementById('ncmCookie').value.trim() : document.getElementById('biliCookie').value.trim();
+  const v = kind === 'ncm' ? $('ncmCookie').value.trim() : $('biliCookie').value.trim();
   const r = await (await fetch('/api/cookie', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({kind, value:v}) })).json();
-  if (r.ok) { log('✓ cookie已保存', 'ok'); loadStatus(); if (kind==='ncm') loadList(); }
-  else log('✗ 保存失败: ' + r.error, 'err');
+  if (r.ok) {
+    if (kind === 'ncm') $('ncmCookie').value = ''; else $('biliCookie').value = '';
+    loadStatus(); if (kind === 'ncm') loadList();
+  } else alert('保存失败: ' + r.error);
 }
 async function loadHistory() {
-  const j = await (await fetch('/api/history')).json();
-  const tb = document.getElementById('history');
-  if (!j.items.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">暂无记录</td></tr>'; return; }
-  tb.innerHTML = j.items.map(h =>
-    '<tr><td style="color:#888;white-space:nowrap">' + esc(h.time) + '</td><td>' + esc(h.song) + '</td><td>'
-    + esc(h.bvid + '?p=' + h.page) + '</td><td>' + (h.size ? (h.size/1048576).toFixed(1)+'MB' : '-') + '</td></tr>').join('');
+  try {
+    const j = await (await fetch('/api/history')).json();
+    const box = $('history');
+    if (!j.items.length) { box.innerHTML = '<div class="empty">暂无记录</div>'; return; }
+    box.innerHTML = j.items.map(h =>
+      '<div class="h-row"><span class="h-time">' + esc(h.time) + '</span><span class="h-name">' + esc(h.song) + '</span>'
+      + '<span class="h-size">' + (h.size ? (h.size/1048576).toFixed(1)+'MB' : '-') + '</span></div>').join('');
+  } catch (e) { /* 历史加载失败不打扰主流程 */ }
 }
+// 空状态带行动 / 加载失败可重试 / grid 行布局
 async function loadList() {
-  const j = await (await fetch('/api/list')).json();
-  document.getElementById('stats').textContent = '共 ' + j.count + ' 首 | 已用 ' + (j.size/1048576).toFixed(1) + ' MB' + (j.error ? ' | ' + j.error : '');
-  const tb = document.getElementById('list');
-  if (!j.songs.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">' + (j.error ? esc(j.error) : '云盘为空') + '</td></tr>'; return; }
-  tb.innerHTML = j.songs.map(s =>
-    '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.artist) + '</td><td>' +
-    (s.bitrate ? Math.round(s.bitrate/1000)+'kbps' : '-') + '</td><td>' +
-    (s.size ? (s.size/1048576).toFixed(1)+'MB' : '-') + '</td>' +
-    '<td><span class="del" onclick="del(' + s.songId + ')">删除</span></td></tr>').join('');
+  const box = $('list');
+  try {
+    const j = await (await fetch('/api/list')).json();
+    $('stats').textContent = '共 ' + j.count + ' 首 · ' + (j.size/1048576).toFixed(1) + ' MB';
+    if (j.error) { box.innerHTML = '<div class="empty">' + esc(j.error) + '<br><button onclick="loadList()">重试</button></div>'; return; }
+    if (!j.songs.length) { box.innerHTML = '<div class="empty">云盘还是空的<br><button onclick="focusInput()">去上传第一首</button></div>'; return; }
+    box.innerHTML = j.songs.map(s =>
+      '<div class="song"><div class="s-name">' + esc(s.name) + '</div><div class="s-artist">' + esc(s.artist) + '</div>'
+      + '<div class="s-meta">' + (s.bitrate ? Math.round(s.bitrate/1000)+'kbps' : '-') + ' · ' + (s.size ? (s.size/1048576).toFixed(1)+'MB' : '-') + '</div>'
+      + '<button class="s-del" data-id="' + s.songId + '" data-name="' + esc(s.name) + '">删除</button></div>').join('');
+  } catch (e) {
+    box.innerHTML = '<div class="empty">加载失败<button onclick="loadList()">重试</button></div>';
+  }
 }
-async function del(id) {
-  if (!confirm('确定从云盘删除这首歌曲?')) return;
-  await fetch('/api/del', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({songId:id}) });
-  loadList();
+$('list').addEventListener('click', e => {
+  const b = e.target.closest('.s-del'); if (!b) return;
+  if (!confirm('确定从云盘删除《' + b.dataset.name + '》?')) return;
+  fetch('/api/del', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({songId:+b.dataset.id}) }).then(loadList);
+});
+// 解析分P范围: '1-47' / '1,3,5-8' → 有序数组; 空 → null; 格式错 → 'ERR'
+function parsePages(s) {
+  if (!s.trim()) return null;
+  const out = new Set();
+  for (const part of s.split(/[,，]/)) {
+    const m = part.trim().match(/^(\\d+)(?:\\s*[-~]\\s*(\\d+))?$/);
+    if (!m) return 'ERR';
+    const a = +m[1], b = m[2] ? +m[2] : a;
+    for (let i = Math.min(a,b); i <= Math.max(a,b); i++) out.add(i);
+  }
+  return Array.from(out).sort((x,y)=>x-y);
 }
 async function doUpload() {
-  const input = document.getElementById('input').value.trim();
-  if (!input) return;
-  const btn = document.getElementById('go');
-  btn.disabled = true; btn.textContent = '处理中...';
-  document.getElementById('log').innerHTML = ''; document.getElementById('log').style.display='block';
+  const input = $('input').value.trim();
+  if (!input) { $('input').focus(); return; }
+  const allPages = $('allPages').checked;
+  let pages = null;
+  if (!allPages) {
+    pages = parsePages($('pages').value);
+    if (pages === 'ERR') { alert('分P范围格式不对, 示例: 1-47 或 1,3,5-8'); return; }
+  }
+  const btn = $('go');
+  btn.disabled = true; btn.textContent = '上传中';
+  lastTotal = 0;
+  $('progress').hidden = false;
+  $('running').hidden = false; $('finished').hidden = true;
+  $('pErrs').hidden = true; $('pErrs').textContent = '';
+  $('rawlog').textContent = '';
+  $('pTitle').textContent = '正在上传'; $('pNow').textContent = '准备中';
+  $('pCount').textContent = ''; $('pBar').style.width = '3%';
   try {
     const res = await fetch('/api/upload', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ input, quality: document.getElementById('quality').value,
-        allPages: document.getElementById('allPages').checked,
-        clean: document.getElementById('clean').checked,
-        song: document.getElementById('song').value.trim(), artist: document.getElementById('artist').value.trim() }) });
+      body: JSON.stringify({ input, quality: $('quality').value, allPages, pages,
+        clean: $('clean').checked, song: $('song').value.trim(), artist: $('artist').value.trim() }) });
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
@@ -528,12 +680,34 @@ async function doUpload() {
       for (const l of lines) {
         if (!l.trim()) continue;
         const j = JSON.parse(l);
-        if (j.type === 'done') { log('✓ 全部完成: ' + j.results.map(r => r.song + '(id=' + r.songId + ')').join(', '), 'ok'); loadList(); loadHistory(); }
-        else if (j.type === 'error') log('✗ ' + j.msg, 'err');
-        else log(j.msg);
+        if (j.type === 'done') {
+          const ok = j.results.filter(r => r.ok).length;
+          const fails = j.results.filter(r => !r.ok);
+          $('pBar').style.width = '100%';
+          fails.forEach(f => step('✗ ' + f.song + ': ' + f.error, true));
+          $('running').hidden = true; $('finished').hidden = false;
+          $('pDone').innerHTML = '上传完成<span>成功 ' + ok + ' / ' + j.results.length + (fails.length ? ', 失败明细见上方' : ', 已加入云盘') + '</span>';
+          loadList(); loadHistory();
+        } else if (j.type === 'error') {
+          step('✗ ' + j.msg, true);
+          $('running').hidden = true; $('finished').hidden = false;
+          $('pDone').innerHTML = '上传失败<span>请查看错误信息</span>';
+        } else {
+          step(j.msg); phaseBar(j.msg);
+          const m = j.msg.match(/\\[(\\d+)\\/(\\d+)\\]/);
+          if (m) {
+            lastTotal = +m[2];
+            setBar(+m[1], +m[2]);
+            $('pTitle').textContent = j.msg.replace(/===\\s*\\[.*?\\]\\s*/, '').replace(/\\s*===\\s*$/, '');
+          }
+        }
       }
     }
-  } catch (e) { log('✗ ' + e.message, 'err'); }
+  } catch (e) {
+    step('✗ ' + e.message, true);
+    $('running').hidden = true; $('finished').hidden = false;
+    $('pDone').innerHTML = '上传失败<span>' + esc(e.message.slice(0, 80)) + '</span>';
+  }
   btn.disabled = false; btn.textContent = '上传';
 }
 loadStatus(); loadList(); loadHistory();
