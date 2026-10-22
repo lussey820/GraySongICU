@@ -1,7 +1,7 @@
 # bili2ncm 项目记忆
 
 > 本文档沉淀项目开发全程的关键结论、协议知识与实测经验，供后续维护与二次开发参考。
-> 更新于 2026-10-19。
+> 更新于 2026-10-22。
 
 ---
 
@@ -44,6 +44,9 @@
 - **风控间隔**：批量上传每首间隔 5 秒；单P失败不中断批量，结束汇总成功/失败
 - **云盘列表同步延迟**：上传成功后列表接口可能短暂少显示几首，刷新即恢复
 - **重复发布**：歌曲已在云盘时 pub/v2 会失败但返回歌曲信息，视为已存在
+- **200MB 硬上限（2026-10-22 实测）**：云盘存储层单文件上限 = 209,715,200 字节；200MB+1KB 直传即返回 413
+- **大文件分片绕过已否决**：NOS 分片协议本身可走通（首块响应体返回 `context`，后续块必须放在 URL query `&context=`，放 header 报 400 `does not contains Context, when offset = !0`；253MB 分 4 块全部 200），但随后 info/v2 对 >200MB 单曲返回非 JSON/400，整期入库失败。结论：必须拆成多个 ≤200MB 文件分别入库
+- **大文件首次 info/v2 可能 504**：194MB 文件首次入库处理超过网关约 60 秒返回 HTML 504；此时文件已存进 NOS，稍后重试 info/v2 会 0.2 秒返回 200。故入库重试需覆盖"非 JSON 异常"，不能只判断 code
 
 ## 五、多渠道调查结论（2026-10，QQ/微云/酷狗均已搁置）
 
@@ -76,6 +79,13 @@
 
 - ✅ P0（可开源门槛）：双cookie失效检测、批量韧性、上传历史、日志安全审查
 - ✅ 前端 v0.3 首项：浅色极简改版 + 分P范围
-- ⬜ P1 其余：B站合集(season)支持、批量粘贴多链接、ffmpeg 转码兜底、Releases 打包 exe
-- ⬜ P2：歌单灰色歌曲解锁、定时任务、Dockerfile、更多音频源
+- ✅ P1 主体（2026-10-19）：B站合集（合集页链接 sid 走 seasons_archives_list 分页；BV 属 ugc_season 勾选"整个合集"展开，_inner 防递归）、批量粘贴多链接（runJobs 顺序队列+总汇总）、秒传显式反馈、DELETE /api/history、/api/list 透出 maxSize（实测 60GB）
+- ⬜ P1 其余：仅 Releases 打包 exe（用户计划最后做）；ffmpeg 兜底 + 表单记忆已于 2026-10-19 完成
+- ⬜ P2：歌单灰色歌曲解锁（思路已定：playlist privilege 识别灰歌 → wbi签名B站搜索时长匹配 → 复用上传链路 → /api/cloud/user/upload/match 关联，半自动防风控，match 端点待实测）、定时任务、Dockerfile、更多音频源
 - ❌ 非目标：多平台曲库聚合、账密登录、公网部署、本地下载功能
+
+### 合集/多任务要点（2026-10-19 实测）
+
+- B站"50P"视频多为**单视频多分P**（view.ugc_season 为 null），与"合集"（多个独立视频）是两种结构，分P流程不受影响
+- 合集页链接格式：`space.bilibili.com/{mid}/channel/collectiondetail?sid={season_id}`，缺 mid 会报错提示
+- `seasons_archives_list` 返回 `data.meta.name/total` + `data.archives[].bvid/title`，每页最大 100；空间列表接口字段名是 `items_lists.seasons_list`（非 seasons）
