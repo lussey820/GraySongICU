@@ -82,10 +82,16 @@ const HISTORY_FILE = path.join(DIR, 'history.json');
 function readHistory() {
   try { return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); } catch (e) { return []; }
 }
+// 本地时间, 24 小时制 YYYY-MM-DD HH:mm:ss
+function nowStamp() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
+    + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
 function appendHistory(entry) {
   try {
     const list = readHistory();
-    list.unshift({ time: new Date().toISOString().replace('T', ' ').slice(0, 19), ...entry });
+    list.unshift({ time: nowStamp(), ...entry });
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(list.slice(0, 500), null, 2));
   } catch (e) { /* 历史写失败不影响上传 */ }
 }
@@ -225,6 +231,200 @@ async function cloudList() {
 }
 async function cloudDel(songId) {
   return ncmReq('/api/cloud/del', { songIds: songId });
+}
+
+// ---------- 灰歌扫描: 歌单里因 VIP/版权原因无法播放的歌 ----------
+let ncmUidCache = null;
+async function ncmUid() {
+  if (ncmUidCache) return ncmUidCache;
+  const j = await ncmReq('/api/nuser/account/get', {});
+  if (j.code !== 200 || !j.account) throw new Error('无法获取网易云账号, 请先登录网易云');
+  ncmUidCache = j.account.id;
+  return ncmUidCache;
+}
+async function ncmPlaylists() {
+  const uid = await ncmUid();
+  const j = await ncmReq('/api/user/playlist', { uid, limit: 100, offset: 0, includeVideo: false });
+  if (j.code !== 200) throw new Error('歌单读取失败: ' + (j.message || j.code));
+  return (j.playlist || []).map(p => ({ id: p.id, name: p.name, count: p.trackCount || 0, special: p.specialType === 5 }));
+}
+// 「我喜欢的音乐」歌单 id (specialType=5)
+async function likedPlaylistId() {
+  const pl = await ncmPlaylists();
+  const hit = pl.find(p => p.special);
+  return hit ? hit.id : null;
+}
+// 侧栏数据: 我喜欢的音乐按总播放次数排序 + 网易云每日推荐
+let sideCache = { at: 0, data: null };
+async function ncmSide() {
+  if (sideCache.data && Date.now() - sideCache.at < 10 * 60 * 1000) return sideCache.data;
+  const uid = await ncmUid();
+  const pid = await likedPlaylistId();
+  const out = { liked: [], rec: [] };
+  let tracks = [];
+  if (pid) {
+    const j = await ncmReq('/api/v6/playlist/detail', { id: Number(pid), n: 1000, s: 0 });
+    if (j.code === 200 && j.playlist) tracks = j.playlist.tracks || [];
+  }
+  let record = null;
+  try { record = await ncmReq('/api/v1/play/record', { uid, type: 0 }); } catch (e) { record = null; }
+  const counts = new Map();
+  for (const it of (record && record.allData) || []) {
+    if (it.song && it.song.id) counts.set(it.song.id, it.playCount || 0);
+  }
+  out.liked = tracks.map(t => ({
+    id: t.id,
+    name: t.name || '?',
+    artist: (t.ar || []).map(a => a.name).filter(Boolean).join('/'),
+    count: counts.get(t.id) || 0,
+  })).sort((a, b) => b.count - a.count).slice(0, 3);
+  try {
+    // ---- 行为画像: 总榜(长期) + 周榜(近期) + 关注艺人 + 我的喜欢 ----
+    let allRes = null, weekRes = null, subRes = null;
+    try { allRes = await ncmReq('/api/v1/play/record', { uid, type: 0 }); } catch (e) {}
+    try { weekRes = await ncmReq('/api/v1/play/record', { uid, type: 1 }); } catch (e) {}
+    try { subRes = await ncmReq('/api/artist/sublist', { limit: 100, offset: 0 }); } catch (e) {}
+    const allData = (allRes && allRes.allData) || [];
+    const weekPlays = new Map();
+    for (const it of (weekRes && weekRes.weekData) || []) {
+      if (it.song && it.song.id) weekPlays.set(it.song.id, it.playCount || 0);
+    }
+    const followed = new Set(((subRes && subRes.data) || []).map(a => a.id));
+    const heard = new Set(counts.keys()); // 常听榜里的歌不再重复推荐
+
+    // 歌手亲和度: 累计播放量取对数; 喜欢歌单里的歌额外加权
+    const artistPlay = new Map();
+    for (const it of allData) {
+      const pc = it.playCount || 0;
+      for (const a of ((it.song || {}).ar) || []) artistPlay.set(a.id, (artistPlay.get(a.id) || 0) + pc);
+    }
+    for (const t of tracks) for (const a of t.ar || []) artistPlay.set(a.id, (artistPlay.get(a.id) || 0) + 8);
+    const maxArtistPlay = Math.max(1, ...artistPlay.values());
+
+    // ---- 风格圈: 用总榜前 8 首当种子, 取网易云「相似歌曲」 ----
+    const seeds = allData.slice(0, 8).map(x => x.song).filter(Boolean);
+    const simiSets = await Promise.all(seeds.map(s =>
+      ncmReq('/api/v1/discovery/simiSong', { songid: s.id, limit: 50 }).catch(() => null)));
+    const styleSongs = new Map(); // id -> { song, w }
+    const styleArtists = new Set();
+    simiSets.forEach((j, i) => {
+      const seedW = 0.7 + 0.3 * (1 - i / Math.max(1, seeds.length));
+      const seedArt = new Set(((seeds[i] || {}).ar || []).map(a => a.id));
+      for (const s of ((j && j.songs) || [])) {
+        const ar = s.artists || s.ar || [];
+        for (const a of ar) styleArtists.add(a.id);
+        if (heard.has(s.id)) continue;
+        // 同一歌手的相似曲更多是「歌手重复」而非「风格相近」, 降权
+        const sameArtist = ar.some(a => seedArt.has(a.id));
+        const w = seedW * Math.min(1, (s.score || 0) / 100) * (sameArtist ? 0.35 : 1);
+        const prev = styleSongs.get(s.id);
+        if (!prev || prev.w < w) styleSongs.set(s.id, { song: s, w });
+      }
+    });
+
+    // ---- 候选池: 相似歌曲(风格驱动) + 每日推荐(平台个性化) ----
+    const dailyRes = await ncmReq('/api/v1/discovery/recommend/songs', {}).catch(() => null);
+    const dailySongs = ((dailyRes && dailyRes.data && dailyRes.data.dailySongs) || []);
+    const cands = new Map();
+    const put = (s, isSimi) => {
+      const ar = s.artists || s.ar || [];
+      if (!s.id || heard.has(s.id)) return;
+      const aid = ar.map(a => a.id).filter(Boolean);
+      let aMax = 0;
+      for (const id of aid) aMax = Math.max(aMax, artistPlay.get(id) || 0);
+      let artistScore = Math.log1p(aMax) / Math.log1p(maxArtistPlay);
+      if (aid.some(id => followed.has(id))) artistScore = Math.min(1, artistScore + 0.25);
+      const alg = String(s.alg || '') + ' ' + String(s.reason || '') + ' ' + String(s.recommendReason || '');
+      let styleScore;
+      if (isSimi) {
+        const sw = styleSongs.get(s.id);
+        styleScore = 0.55 + 0.45 * (sw ? sw.w : 0.5);
+      } else {
+        styleScore = /vec|embedding|interest|hstu_multi|hpCover|sim_song/.test(alg) ? 0.65 : 0.4;
+        if (aid.some(id => styleArtists.has(id))) styleScore = Math.min(0.8, styleScore + 0.15);
+      }
+      const pop = Number(s.popularity != null ? s.popularity : (s.pop || 0)) || 0;
+      const heat = Math.min(1, pop / 100);
+      const fresh = weekPlays.has(s.id) ? 0.2 : 1; // 最近在听过的先让位
+      const score = styleScore * 0.55 + artistScore * 0.2 + heat * 0.15 + fresh * 0.1;
+      const prev = cands.get(s.id);
+      if (prev && prev.styleScore >= styleScore) return;
+      cands.set(s.id, {
+        id: s.id,
+        name: s.name || '?',
+        artist: ar.map(a => a.name).filter(Boolean).join('/'),
+        artistIds: aid,
+        styleScore, score,
+      });
+    };
+    for (const [id, v] of styleSongs) put(v.song, true);
+    for (const s of dailySongs) put(s, false);
+
+    // ---- 排序 + 同名去重 + 每位艺人最多 1 首(风格多样, 防单歌手屠榜) ----
+    const seenName = new Set(), usedArtist = new Map();
+    out.rec = [...cands.values()].sort((a, b) => b.score - a.score).filter(c => {
+      const nk = (c.name + '|' + c.artist).toLowerCase();
+      if (seenName.has(nk)) return false;
+      if (c.artistIds.some(id => (usedArtist.get(id) || 0) >= 1)) return false;
+      seenName.add(nk);
+      for (const id of c.artistIds) usedArtist.set(id, (usedArtist.get(id) || 0) + 1);
+      return true;
+    }).slice(0, 10);
+
+    // 印章显示相对相似度: 榜首≈97%, 末位≈65%
+    const vals = out.rec.map(s => s.score);
+    const maxS = Math.max(0.001, ...vals), minS = Math.min(...vals);
+    out.rec = out.rec.map(s => ({
+      id: s.id, name: s.name, artist: s.artist,
+      score: Math.round(65 + ((s.score - minS) / Math.max(0.001, maxS - minS)) * 32),
+    }));
+  } catch (e) { /* 推荐失败不影响喜欢列表 */ }
+  sideCache = { at: Date.now(), data: out };
+  return out;
+}
+// 扫描分两类: 暂无音源(pl=0 或 st<0) / VIP专属(fee=1 且当前账号能播)
+async function scanPlaylist(pid) {
+  const j = await ncmReq('/api/v6/playlist/detail', { id: Number(pid), n: 1000, s: 0 });
+  if (j.code !== 200 || !j.playlist) throw new Error('歌单打开失败: ' + (j.message || j.code));
+  const pl = j.playlist;
+  const priv = new Map((j.privileges || []).map(p => [p.id, p]));
+  const gray = [], vip = [];
+  for (const t of pl.tracks || []) {
+    const p = priv.get(t.id);
+    if (!p) continue;
+    const item = {
+      id: t.id,
+      name: t.name || '?',
+      artist: (t.ar || []).map(a => a.name).filter(Boolean).join('/'),
+      album: (t.al || {}).name || '',
+      durMs: t.dt || 0,
+      fee: p.fee || 0,
+    };
+    if (p.pl === 0 || p.st < 0) gray.push(item);
+    else if (p.fee === 1) vip.push(item);
+  }
+  return { id: pl.id, name: pl.name, total: pl.trackCount || (pl.tracks || []).length, gray, vip };
+}
+// 歌单增删曲目: 加一律进「我喜欢的音乐」, 删从指定歌单移除
+async function editPlaylistTracks({ op, pid, ids }) {
+  let target = Number(pid);
+  if (op === 'add') {
+    target = await likedPlaylistId();
+    if (!target) throw new Error('找不到「我喜欢的音乐」歌单');
+  }
+  if (!Number.isFinite(target) || target <= 0) throw new Error('缺少歌单');
+  const j = await ncmReq('/api/playlist/manipulate/tracks', {
+    op: op === 'del' ? 'del' : 'add',
+    pid: target,
+    trackIds: JSON.stringify(ids),
+    imme: true,
+  });
+  if (j.code !== 200) {
+    // 已在该歌单里视为成功, 避免重复添加时报错
+    if (String(j.message || '').indexOf('重复') > -1) return { id: target, count: ids.length, already: true };
+    throw new Error(j.message || ('操作失败 code ' + j.code));
+  }
+  return { id: target, count: ids.length };
 }
 
 // 上传一个音频文件(Buffer)到云盘, 返回 songId
@@ -683,9 +883,9 @@ function parseSeason(input) {
   const mid = (input.match(/space\.bilibili\.com\/(\d+)/) || [])[1];
   return { sid, mid: mid || null };
 }
-// 输入拆分: 字符串按空白/逗号分号拆成多任务, 数组原样用
+// 输入拆分: 多任务统一用逗号分隔(兼容换行), 数组原样用
 function parseInputs(raw) {
-  const arr = Array.isArray(raw) ? raw : String(raw || '').split(/[\s,，;；]+/);
+  const arr = Array.isArray(raw) ? raw : String(raw || '').split(/[,，\r\n]+/);
   return arr.map(s => String(s).trim()).filter(Boolean);
 }
 // 小宇宙单集: https://www.xiaoyuzhoufm.com/episode/{id}
@@ -785,7 +985,12 @@ async function runJobs(inputs, opts, send) {
   const results = [];
   for (let i = 0; i < inputs.length; i++) {
     const item = inputs[i];
-    if (i > 0) { send('为避免平台限制, 等待5秒后继续...'); await sleep(5000); }
+    if (i > 0) {
+      // 批量时先单独传完第 1 条, 其余每条之间随机等待 6~9 秒, 降低连续请求带来的风控
+      const wait = 6000 + Math.floor(Math.random() * 3000);
+      send(`已完成 ${i}/${inputs.length} 条, 为避免平台限制等待 ${Math.round(wait / 1000)} 秒后继续...`);
+      await sleep(wait);
+    }
     const season = parseSeason(item);
     const podcast = parsePodcast(item);
     try {
@@ -959,22 +1164,26 @@ const PAGE = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>bili2ncm — B站音频传网易云云盘</title>
+<title>网易云灰歌补全器</title>
 <style>
   :root{ --red:#ec4141; --red-dark:#d63a3a; --bg:#f6f6f8; --card:#fff; --line:#ebebef; --line-soft:#f2f2f5; --t1:#1f1f22; --t2:#6b6b72; --t3:#9b9ba2; --ok:#2bb673; --bad:#d5453c; }
   *{margin:0;padding:0;box-sizing:border-box}
   [hidden]{display:none !important}
+  html{scrollbar-gutter:stable}
   body{background:var(--bg);color:var(--t1);font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
   input,select,button{font-family:inherit}
   :focus-visible{outline:2px solid var(--red);outline-offset:2px;border-radius:4px}
 
   .top{background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
-  .top-in{max-width:720px;margin:0 auto;height:56px;padding:0 16px;display:flex;align-items:center;justify-content:space-between}
+  .top-in{max-width:1080px;margin:0 auto;height:56px;padding:0 16px;display:flex;align-items:center;justify-content:space-between}
   .brand{font-size:15px;font-weight:600;letter-spacing:.2px}
   .tabs{display:flex;gap:2px;background:#f1f1f4;border-radius:9px;padding:3px}
   .tab{height:32px;padding:0 18px;border:none;border-radius:7px;background:transparent;color:var(--t2);font-size:13px;cursor:pointer;transition:background .15s,color .15s}
   .tab:hover{color:var(--t1)}
   .tab.on{background:#fff;color:var(--red);font-weight:500;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+  .seg{display:inline-flex;gap:2px;background:#f1f1f4;border-radius:9px;padding:3px;margin-bottom:14px}
+  .seg-btn{height:28px;padding:0 18px;border:none;border-radius:7px;background:transparent;color:var(--t2);font-size:12.5px;cursor:pointer;transition:background .15s,color .15s}
+  .seg-btn.on{background:#fff;color:var(--red);font-weight:500;box-shadow:0 1px 3px rgba(0,0,0,.06)}
   .account{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--t2)}
   .dot{width:7px;height:7px;border-radius:50%;background:#c9c9cf}
   .dot.on{background:var(--ok)} .dot.off{background:var(--bad)}
@@ -982,7 +1191,36 @@ const PAGE = `<!DOCTYPE html>
   .link{background:none;border:none;color:var(--t3);font-size:13px;cursor:pointer;padding:10px 4px}
   .link:hover{color:var(--red)}
 
-  main{max-width:720px;margin:0 auto;padding:20px 16px 40px}
+  main{max-width:1080px;margin:0 auto;padding:20px 16px 40px}
+  main > .card,main > .progress,main > .hist,main > .foot,main > .compare:not(.split){max-width:688px;margin-left:auto;margin-right:auto}
+  main > #uploadCard,main > #compare,main > .hist,main > .progress,main > .foot{max-width:none}
+  .fix-wrap{display:grid;grid-template-columns:minmax(0,820px) minmax(0,1fr);gap:16px;align-items:stretch;max-width:1048px;margin:0 auto}
+  #fixCard{display:flex;flex-direction:column}
+  #grayList{flex:1;min-height:0;display:flex;flex-direction:column}
+  #grayList > .empty{margin:auto 0}
+  .side{padding:16px 16px 12px;position:sticky;top:72px;max-height:calc(100vh - 92px);overflow:auto}
+  .side-h{font-size:12.5px;font-weight:600;color:var(--t2)}
+  .side-note{font-weight:400;font-size:11px;color:var(--t3);margin-left:5px}
+  .side-sec{margin-top:14px;padding-top:12px;border-top:1px solid var(--line-soft)}
+  .side-item{padding:7px 0;border-top:1px dashed var(--line-soft)}
+  #sideLiked .side-item:first-child,#sideRec .side-item:first-child{border-top:0}
+  .side-name{font-size:12.5px;color:var(--t1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .side-sub{font-size:11.5px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+  .side-empty{font-size:12px;color:var(--t3);padding:6px 0}
+  .side-line{display:flex;align-items:center;gap:6px}
+  .side-line .side-name{flex:1;min-width:0}
+  .stamp{flex:none;font-size:9.5px;font-weight:600;line-height:1;letter-spacing:.3px;color:var(--red);border:1px solid rgba(236,65,65,.55);box-shadow:inset 0 0 0 .5px rgba(236,65,65,.2);border-radius:3px;padding:2px 3px 1px;transform:rotate(-5deg);opacity:.85}
+  .rec-nav{display:flex;align-items:flex-end;justify-content:space-between;margin-top:8px;height:26px}
+  .rec-nav .fold{position:relative;width:26px;height:26px;padding:0;border:0;background:transparent;cursor:pointer;transition:transform .18s,filter .18s,opacity .18s}
+  .rec-nav .fold::before{content:'';position:absolute;inset:0}
+  .rec-nav .fold-next::before{background:linear-gradient(225deg,#fbfbfe 0%,#eeeef4 45%,#dcdce4 100%);clip-path:polygon(100% 0,100% 100%,0 100%)}
+  .rec-nav .fold-prev::before{background:linear-gradient(135deg,#fbfbfe 0%,#eeeef4 45%,#dcdce4 100%);clip-path:polygon(0 0,100% 100%,0 100%)}
+  .rec-nav .fold-next{filter:drop-shadow(-2px -2px 3px rgba(18,18,26,.2)) drop-shadow(-1px -1px 1px rgba(18,18,26,.12))}
+  .rec-nav .fold-prev{filter:drop-shadow(2px -2px 3px rgba(18,18,26,.2)) drop-shadow(1px -1px 1px rgba(18,18,26,.12))}
+  .rec-nav .fold-next:hover:not(:disabled){transform:translate(-1px,-1px);filter:drop-shadow(-3px -3px 5px rgba(18,18,26,.24)) drop-shadow(-1px -1px 1px rgba(18,18,26,.14))}
+  .rec-nav .fold-prev:hover:not(:disabled){transform:translate(1px,-1px);filter:drop-shadow(3px -3px 5px rgba(18,18,26,.24)) drop-shadow(1px -1px 1px rgba(18,18,26,.14))}
+  .rec-nav .fold:disabled{opacity:.35;filter:none;cursor:default}
+  @media (max-width:900px){.fix-wrap{grid-template-columns:1fr}.side{position:static;max-height:none}}
   .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px}
   .card h2{font-size:15px;font-weight:600}
 
@@ -991,6 +1229,8 @@ const PAGE = `<!DOCTYPE html>
   .upload textarea{resize:none;padding-top:11px;line-height:1.4}
   .upload input::placeholder,.upload textarea::placeholder{color:#b0b0b8}
   .upload input:focus,.upload textarea:focus{border-color:var(--red)}
+  .clip{height:44px;padding:0 14px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--t2);font-size:13px;cursor:pointer;white-space:nowrap;transition:background .15s,color .15s}
+  .clip:hover{background:#f7f7fa;color:var(--t1)}
   .upload select{width:126px;height:44px;padding:0 10px;border:1px solid #e3e3e9;border-radius:8px;background:#fff;font-size:13px;color:var(--t1);outline:none;cursor:pointer}
   .btn{height:44px;padding:0 26px;border:none;border-radius:8px;background:var(--red);color:#fff;font-size:14px;font-weight:500;cursor:pointer;transition:background .15s}
   .btn:hover{background:var(--red-dark)}
@@ -1012,16 +1252,28 @@ const PAGE = `<!DOCTYPE html>
   .mini.primary:hover{background:var(--red-dark);border-color:var(--red-dark);color:#fff}
 
   .acct-modal{position:fixed;inset:0;z-index:60;background:rgba(24,24,28,.32);display:flex;align-items:center;justify-content:center;padding:16px}
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:80;background:rgba(31,31,34,.92);color:#fff;font-size:13px;padding:10px 18px;border-radius:9px;box-shadow:0 6px 24px rgba(0,0,0,.18);animation:toastIn .18s ease}
+  @keyframes toastIn{from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}
   .acct-card{background:#fff;border-radius:14px;padding:18px 20px 16px;width:min(440px,100%);max-height:88vh;overflow:auto;box-shadow:0 12px 40px rgba(0,0,0,.16)}
   .acct-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-size:15px;font-weight:600;color:var(--t1)}
   .acct-card .crow{display:flex;gap:10px}
   .acct-card input{flex:1;min-width:0;height:40px;padding:0 10px;border:1px solid #e3e3e9;border-radius:7px;font-size:13px;outline:none}
   .acct-card input:focus{border-color:var(--red)}
   .mini{background:#fff;border:1px solid var(--line);border-radius:7px;padding:9px 14px;font-size:12.5px;color:var(--t2);cursor:pointer}
+  .mini.ready{color:var(--red);border-color:#f0c6c6}
+  .mini.ready:hover{background:#fff5f5;border-color:var(--red)}
   .mini:hover{color:var(--red);border-color:#f3c9c9}
   .mini:disabled{background:#fafafc;color:var(--t3);border-color:var(--line-soft);cursor:default}
   .acct-btn{background:#fff;border:1px solid var(--line);border-radius:20px;padding:7px 14px;cursor:pointer}
   .acct-btn:hover{border-color:#f3c9c9;color:var(--red)}
+  .top-right{display:flex;align-items:center;gap:8px}
+  .guide-btn{display:flex;align-items:center;gap:6px;background:#fff;border:1px solid var(--line);border-radius:20px;padding:7px 12px;font-size:12.5px;color:var(--t2);cursor:pointer}
+  .guide-btn:hover{border-color:#f3c9c9;color:var(--red)}
+  .guide-btn .q{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:#f1f1f4;font-size:11px;font-weight:600;flex:none}
+  .guide-step{display:flex;gap:10px;padding:10px 0;font-size:13px;line-height:1.75;color:var(--t2)}
+  .guide-step + .guide-step{border-top:1px solid var(--line-soft)}
+  .guide-num{flex:none;width:20px;height:20px;border-radius:50%;background:var(--red);color:#fff;font-size:11.5px;display:flex;align-items:center;justify-content:center;margin-top:1px}
+  .guide-tip{margin-top:10px;padding:10px 12px;background:#fafafa;border-radius:8px;font-size:12px;color:var(--t3);line-height:1.7}
   .acc-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0 12px;border-bottom:1px solid var(--line-soft);font-size:13px;color:var(--t2)}
   .acc-row:last-of-type{border-bottom:none;padding-bottom:2px}
   .acc-info{display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:wrap}
@@ -1056,7 +1308,7 @@ const PAGE = `<!DOCTYPE html>
   .cloud{margin-top:14px}
   .compare{margin-top:14px}
   .compare .cloud{margin-top:0}
-  .compare.split{display:grid;grid-template-columns:minmax(0,1.12fr) minmax(0,0.88fr);gap:16px;align-items:stretch}
+  .compare.split{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:16px;align-items:stretch}
   .compare.split > .card{display:flex;flex-direction:column;height:calc(100vh - 250px);min-height:440px;padding:18px 22px}
   .compare.split > .card.cloud{background:#fbfbfd}
   .compare.split #sres,.compare.split #list{flex:1;min-height:0;overflow:auto;padding-right:6px;scrollbar-width:thin;scrollbar-color:#dedee4 transparent}
@@ -1067,13 +1319,10 @@ const PAGE = `<!DOCTYPE html>
   .compare.split .sr-head{position:sticky;top:0;z-index:1;background:#fff;padding:6px 0 9px}
   .compare.split .sr,.compare.split .song{padding:13px 0}
   .compare.split .song{grid-template-columns:1fr 1fr 92px 34px;gap:10px}
-  main.split{max-width:1080px}
-  main.split > .card,main.split > .progress,main.split > .hist,main.split > .foot{max-width:720px;margin-left:auto;margin-right:auto}
   @media (max-width:900px){
     .compare.split{display:block}
     .compare.split > .card{height:auto;min-height:0}
     .compare.split #sres,.compare.split #list{overflow:visible}
-    main.split{max-width:720px}
   }
 
   .cloud-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px}
@@ -1088,7 +1337,9 @@ const PAGE = `<!DOCTYPE html>
   .empty{padding:34px 0 30px;text-align:center;color:var(--t3);font-size:13px;border-top:1px solid var(--line-soft)}
   .empty button{background:none;border:none;color:var(--red);font-size:13px;cursor:pointer;padding:8px}
   #sres{margin-top:4px}
-  .sr-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:4px 0 8px;border-top:1px solid var(--line-soft);font-size:12.5px;color:var(--t3)}
+  .search-empty{flex:1;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;color:var(--t3);font-size:13px}
+  .sr-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:4px 0 8px;border-top:1px solid var(--line-soft);font-size:12.5px;color:var(--t3);flex-wrap:wrap}
+  .sr-btns{display:flex;gap:8px;flex-wrap:wrap}
   .sr-head .chk{padding:2px 0}
   .badge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:4px;background:#fdeeee;color:var(--red);font-size:11px;font-weight:400;vertical-align:1px}
   .sr{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 0;border-top:1px solid var(--line-soft);font-size:13px}
@@ -1096,8 +1347,54 @@ const PAGE = `<!DOCTYPE html>
   .sr-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .sr-m{margin-top:2px;color:var(--t3);font-size:12px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .sr-a{display:flex;gap:8px;flex-shrink:0}
-  #pv{padding:10px 0;border-bottom:1px solid var(--line-soft)}
-  #pv iframe{width:100%;aspect-ratio:16/9;border:0;border-radius:8px;display:block}
+  #listenModal,#srcModal{align-items:flex-end;padding:0;background:rgba(24,24,28,.1);backdrop-filter:blur(1.5px)}
+  #listenModal{z-index:62}
+  #srcModal{z-index:61}
+  .src-list{max-height:52vh;overflow:auto;margin:10px 0 12px;padding-right:4px;border-top:1px solid var(--line-soft)}
+  .listen-card{width:min(760px,100%);max-height:92vh;overflow:auto;background:#fff;border:1px solid #ececf0;border-bottom:0;border-radius:16px 16px 0 0;padding:10px 18px 18px;box-shadow:0 -8px 24px rgba(20,20,24,.07);animation:sheetIn .22s ease}
+  @keyframes sheetIn{from{opacity:.55;transform:translateY(16px)}to{opacity:1;transform:none}}
+  .listen-grip{width:36px;height:4px;border-radius:2px;background:#e2e2e6;margin:0 auto 10px}
+  .listen-title{font-size:14px;font-weight:600;color:var(--t1);word-break:break-all}
+  .listen-sub{font-size:11.5px;color:var(--t3);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .listen-video{margin:10px 0 12px;aspect-ratio:16/9;background:#101012;border-radius:9px;overflow:hidden}
+  .listen-video iframe{width:100%;height:100%;border:0;display:block}
+  .listen-acts{display:flex;gap:10px;align-items:center;justify-content:flex-end}
+  .listen-go{animation:goBreathe 2.1s ease-in-out infinite}
+  @keyframes goBreathe{0%,100%{box-shadow:0 0 0 0 rgba(236,65,65,.22)}55%{box-shadow:0 0 0 7px rgba(236,65,65,0)}}
+  .fix-pick select{flex:1;width:auto;min-width:0}
+  .gq{border-top:1px solid var(--line-soft);padding:2px 0}
+  .gq:first-of-type{border-top:none}
+  .gq-row{display:flex;align-items:center;gap:10px;padding:11px 0;font-size:13px}
+  .gq-l{flex:1;min-width:0}
+  .gq-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .gq-m{margin-top:2px;color:var(--t3);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .gq-a{flex:none}
+  .gq.filled .gq-t{color:var(--t3)}
+  .badge.ok{background:#e8f7ef;color:var(--ok)}
+  .cand-empty{padding:8px 0 12px;font-size:12.5px;color:var(--t3)}
+  .cand-empty button{margin-left:6px}
+  .cand{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:9px 0;border-top:1px dashed var(--line)}
+  .cand:first-child{border-top:none}
+  .cand-l{flex:1;min-width:0}
+  .cand-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+  .cand-m{margin-top:2px;color:var(--t3);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cand-a{display:flex;gap:8px;flex:none}
+  .fix-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .grp{margin-top:14px;border-top:1px solid var(--line-soft)}
+  .grp summary{display:flex;align-items:center;justify-content:space-between;padding:12px 0;font-size:12.5px;color:var(--t2);cursor:pointer;user-select:none}
+  .grp summary:hover{color:var(--red)}
+  .sum-l{display:flex;align-items:center;gap:8px}
+  .sum-r{display:flex;align-items:center;gap:10px;font-size:11.5px;color:var(--t3)}
+  .dot-red{width:7px;height:7px;border-radius:50%;background:var(--red);flex:none}
+  .cta-breathe{color:var(--red);font-size:11.5px;font-weight:500;animation:breathe 2.2s ease-in-out infinite}
+  @keyframes breathe{0%,100%{opacity:.45}50%{opacity:1}}
+  .pick-sub{font-size:12.5px;color:var(--t3);line-height:1.7;margin:4px 0 6px}
+  .pick-all{border-top:1px solid var(--line-soft);padding:8px 0}
+  #pickList{max-height:42vh;overflow:auto;border-top:1px solid var(--line-soft)}
+  .pick-row{display:flex;align-items:center;gap:9px;padding:9px 0;border-bottom:1px solid var(--line-soft);font-size:13px;cursor:pointer}
+  .pick-row input{width:15px;height:15px;accent-color:var(--red);flex:none;cursor:pointer}
+  .pick-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pick-artist{flex:none;color:var(--t3);font-size:12px;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #qrbox{text-align:center;padding:14px 0 6px;border-top:1px solid var(--line-soft);margin-top:12px}
   #qrimg img{width:200px;height:200px;border:1px solid var(--line-soft);border-radius:8px;background:#fff}
   #qrstate{margin:8px 0 4px;font-size:13px;color:var(--t2)}
@@ -1112,7 +1409,8 @@ const PAGE = `<!DOCTYPE html>
 
   .foot{margin-top:18px;text-align:center;font-size:12px;color:#b6b6bd;line-height:1.8}
 
-  @media (max-width:400px){ .brand{display:none} }
+  @media (max-width:560px){ .brand{display:none} .guide-btn .guide-label{display:none} .guide-btn{padding:7px 10px} }
+  @media (max-width:400px){ .tab{padding:0 12px} .acct-btn{padding:7px 10px} }
   @media (max-width:560px){
     .upload{flex-wrap:wrap}
     .upload input[type=text],.upload textarea{flex:1 1 100%}
@@ -1129,19 +1427,52 @@ const PAGE = `<!DOCTYPE html>
 
 <div class="top">
   <div class="top-in">
-    <div class="brand">bili2ncm</div>
+    <div class="brand">灰歌补全器</div>
     <div class="tabs" role="tablist">
-      <button class="tab on" data-tab="music" onclick="switchTab('music')">音乐</button>
-      <button class="tab" data-tab="pod" onclick="switchTab('pod')">播客</button>
+      <button class="tab on" data-tab="fix" onclick="switchTab('fix')">补歌</button>
+      <button class="tab" data-tab="up" onclick="switchTab('up')">上传</button>
     </div>
-    <button class="account acct-btn" id="account" onclick="openAccount()" title="账号登录"><span class="dot"></span><span id="acctText">账号</span></button>
+    <div class="top-right">
+      <button class="account acct-btn" id="account" onclick="openAccount()" title="账号登录"><span class="dot"></span><span id="acctText">账号</span></button>
+      <button class="guide-btn" onclick="openGuide()" title="快速上手"><span class="q">?</span><span class="guide-label">快速上手</span></button>
+    </div>
   </div>
 </div>
 
 <main>
-  <section class="card">
+  <div class="fix-wrap">
+    <section class="card" id="fixCard">
+      <div class="fix-head">
+        <h2>歌单诊断</h2>
+      </div>
+      <div class="upload fix-pick" style="margin-top:14px">
+        <select id="plSel" aria-label="选择歌单"><option value="">正在读取歌单…</option></select>
+        <button class="btn" id="scanBtn" onclick="scanGray()">开始扫描</button>
+      </div>
+      <div id="grayList" style="margin-top:12px"><div class="empty">选择歌单后点击「开始扫描」</div></div>
+    </section>
+    <aside class="card side" id="fixSide">
+      <div class="side-h">我的喜欢<span class="side-note">按播放次数</span></div>
+      <div id="sideLiked"><div class="side-empty">加载中…</div></div>
+      <div class="side-sec">
+        <div class="side-h">推荐歌曲<span class="side-note">每日更新</span></div>
+        <div id="sideRec"><div class="side-empty">加载中…</div></div>
+        <div class="rec-nav" id="recPager" hidden>
+          <button class="fold fold-prev" id="recPrev" onclick="flipRec(-1)" aria-label="上一页"></button>
+          <button class="fold fold-next" id="recNext" onclick="flipRec(1)" aria-label="下一页"></button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <section class="card" id="uploadCard" hidden>
+    <div class="seg" role="tablist" aria-label="上传类型">
+      <button class="seg-btn on" data-type="music" onclick="switchType('music')">音乐</button>
+      <button class="seg-btn" data-type="pod" onclick="switchType('pod')">播客</button>
+    </div>
     <div class="upload">
-      <textarea id="input" rows="1" placeholder="粘贴 B 站视频/合集页链接或 BV 号，可一次粘贴多个"></textarea>
+      <textarea id="input" rows="1" placeholder="粘贴 B 站视频/合集页链接或 BV 号，多个用逗号分隔"></textarea>
+      <button class="clip" type="button" onclick="pasteClipboard()" title="从剪贴板识别链接，自动填入并去重">粘贴板</button>
       <button class="btn" id="go" onclick="doUpload()">上传</button>
     </div>
     <div class="sub">
@@ -1149,7 +1480,7 @@ const PAGE = `<!DOCTYPE html>
       <label class="chk" title="去序号/标签, 拆分'歌手-歌名', 歌手字段自动纠正"><input type="checkbox" id="clean" checked>整理歌名</label>
       <button class="link" onclick="toggleMore()" type="button">手动指定歌名</button>
     </div>
-    <p class="hint" id="podHint" hidden>粘贴小宇宙播客单集链接（xiaoyuzhoufm.com/episode/…），可一次粘贴多期；超过 200MB 时会先询问是否拆分成多个文件。</p>
+    <p class="hint" id="podHint" hidden>粘贴小宇宙播客单集链接（xiaoyuzhoufm.com/episode/…），多个用逗号分隔；超过 200MB 时会先询问是否拆分成多个文件。</p>
     <div class="more" id="more">
       <input type="text" id="song" placeholder="歌名 (留空=自动)">
       <input type="text" id="artist" placeholder="歌手 (留空=自动)">
@@ -1173,13 +1504,14 @@ const PAGE = `<!DOCTYPE html>
     </div>
   </section>
 
-  <div class="compare" id="compare">
+  <div class="compare split" id="compare">
     <section class="card" id="searchCard">
       <div class="upload">
         <input type="text" id="skw" placeholder="搜索 B 站歌曲/翻唱/演唱会…">
         <button class="btn" id="sbtn" onclick="doSearch()">搜索</button>
       </div>
       <div id="sres" hidden></div>
+      <div class="search-empty" id="searchHint">输入歌名后点「搜索」，结果会显示在这里，可与右侧云盘对照</div>
     </section>
 
     <section class="card cloud">
@@ -1245,6 +1577,66 @@ const PAGE = `<!DOCTYPE html>
   </div>
 </div>
 
+<div class="acct-modal" id="guideModal" hidden>
+  <div class="acct-card" role="dialog" aria-label="快速上手">
+    <div class="acct-head"><span id="guideTitle">快速上手</span><button class="mini" onclick="closeGuide()">关闭</button></div>
+    <div id="guideFix">
+      <div class="guide-step"><span class="guide-num">1</span><span>右上角「账号」里分别扫码登录网易云和 B 站。网易云用来读歌单、传云盘，B 站用来找音源。</span></div>
+      <div class="guide-step"><span class="guide-num">2</span><span>选一个歌单点「开始扫描」。扫描后，「共 N 首」右侧会出现「加入我喜欢的音乐」和「取消爱心」两个按钮。</span></div>
+      <div class="guide-step"><span class="guide-num">3</span><span>展开「暂无音源」或「VIP 专属」，点某首歌右侧的「找音源」，先「试听」确认，再点「补进云盘」。</span></div>
+      <div class="guide-step"><span class="guide-num">4</span><span>补完后，统计行右侧按钮会变红。点开后会列出已补的歌，默认全选；再确认一次即可修改「我喜欢的音乐」。还没补歌时点击会提示先去找音源。</span></div>
+      <div class="guide-step"><span class="guide-num">5</span><span>原灰歌默认保留；确认云盘版本能正常播放后，再点「取消爱心」把原歌移出歌单。</span></div>
+      <div class="guide-tip">云盘单个文件上限 200MB。「取消爱心」只动歌单，不删除云盘文件。</div>
+    </div>
+    <div id="guideUp" hidden>
+      <div class="guide-step"><span class="guide-num">1</span><span>右上角「账号」里分别扫码登录网易云和 B 站：网易云用来接收云盘，B 站用来读取音源。</span></div>
+      <div class="guide-step"><span class="guide-num">2</span><span>顶部「上传」里切换「音乐」或「播客」。</span></div>
+      <div class="guide-step"><span class="guide-num">3</span><span>音乐：粘贴 B 站视频/合集链接或 BV 号，可一次粘贴多个；播客：粘贴小宇宙单集链接，可一次粘贴多期。</span></div>
+      <div class="guide-step"><span class="guide-num">4</span><span>点「上传」后，进度和结果会显示在下方；完成后可在「音乐云盘」和上传记录里查看。</span></div>
+      <div class="guide-tip">单个文件超过 200MB 时会询问是否拆分上传，拆分后文件名会自动带（序号/总段数）。</div>
+    </div>
+    <div class="split-act" style="margin-top:14px"><button class="btn" onclick="closeGuide()">知道了</button></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<div class="acct-modal" id="listenModal" hidden>
+  <div class="listen-card" role="dialog" aria-label="试听">
+    <div class="listen-grip"></div>
+    <div class="listen-title" id="listenTitle">试听</div>
+    <div class="listen-sub" id="listenSub"></div>
+    <div class="listen-video"><iframe id="listenFrame" allow="autoplay; fullscreen" allowfullscreen></iframe></div>
+    <div class="listen-acts">
+      <button class="mini" onclick="closeListen()">返回主页</button>
+      <button class="btn listen-go" onclick="openBili()">跳转到 B 站</button>
+    </div>
+  </div>
+</div>
+
+<div class="acct-modal" id="srcModal" hidden>
+  <div class="listen-card" role="dialog" aria-label="找音源">
+    <div class="listen-grip"></div>
+    <div class="listen-title" id="srcTitle">找音源</div>
+    <div class="listen-sub" id="srcSub"></div>
+    <div class="src-list" id="srcList"></div>
+    <div class="listen-acts"><button class="mini" onclick="closeSrc()">关闭</button></div>
+  </div>
+</div>
+
+<div class="acct-modal" id="pickModal" hidden>
+  <div class="acct-card" role="dialog" aria-label="选择歌曲">
+    <div class="acct-head"><span id="pickTitle">选择歌曲</span><button class="mini" onclick="closePick()">关闭</button></div>
+    <p class="pick-sub" id="pickSub"></p>
+    <label class="chk pick-all"><input type="checkbox" id="pickAll" checked onchange="togglePickAll(this.checked)">全选</label>
+    <div id="pickList"></div>
+    <div class="split-act" style="margin-top:14px">
+      <button class="mini" onclick="closePick()">取消</button>
+      <button class="mini primary" id="pickYes" onclick="confirmPick()">确认</button>
+    </div>
+  </div>
+</div>
+
 <div class="bp" id="biliPanel" hidden>
   <div class="bp-bar">
     <span class="bp-t" id="bpTitle">B站搜索</span>
@@ -1257,27 +1649,46 @@ const PAGE = `<!DOCTYPE html>
 <script>
 function esc(s){ return String(s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 const $ = id => document.getElementById(id);
-function lockScroll(){ document.body.style.overflow = (!$('biliPanel').hidden || !$('accountModal').hidden || !$('splitModal').hidden) ? 'hidden' : ''; }
+function lockScroll(){ document.body.style.overflow = (!$('biliPanel').hidden || !$('accountModal').hidden || !$('splitModal').hidden || !$('pickModal').hidden || !$('guideModal').hidden || !$('listenModal').hidden || !$('srcModal').hidden) ? 'hidden' : ''; }
 function openAccount(){ $('accountModal').hidden = false; lockScroll(); }
 function closeAccount(){ $('accountModal').hidden = true; lockScroll(); }
 function toggleManual(){ $('manualBox').hidden = !$('manualBox').hidden; }
 function toggleMore(){ $('more').classList.toggle('open'); }
 function focusInput(){ $('input').focus(); }
 
-// 顶部分类: 音乐(B站) / 播客(小宇宙), 云盘/进度/历史共用
-let curTab = 'music';
+// 导航两级: 一级 补歌/上传; 上传下二级 音乐/播客. 进度与历史共用
+let curTab = 'fix', curType = 'music';
 function switchTab(t) {
-  curTab = t === 'pod' ? 'pod' : 'music';
+  const next = t === 'up' ? 'up' : 'fix';
+  const changed = next !== curTab;
+  curTab = next;
   try { localStorage.setItem('bili2ncm.tab', curTab); } catch (e) {}
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.tab === curTab));
-  const pod = curTab === 'pod';
+  const fix = curTab === 'fix';
+  $('fixCard').hidden = !fix;
+  $('fixSide').hidden = !fix;
+  $('uploadCard').hidden = fix;
+  $('searchCard').hidden = fix || curType === 'pod';
+  $('compare').hidden = fix;
+  if (fix) { setSplit(false); loadPlaylists(); loadSide(); }
+  else applyType();
+  if (changed) window.scrollTo(0, 0);
+}
+function switchType(t) {
+  curType = t === 'pod' ? 'pod' : 'music';
+  try { localStorage.setItem('bili2ncm.type', curType); } catch (e) {}
+  document.querySelectorAll('.seg-btn').forEach(b => b.classList.toggle('on', b.dataset.type === curType));
+  if (curTab === 'up') applyType();
+}
+function applyType() {
+  const pod = curType === 'pod';
   $('input').placeholder = pod
-    ? '粘贴小宇宙播客单集链接（xiaoyuzhoufm.com/episode/…），可一次粘贴多期'
-    : '粘贴 B 站视频/合集页链接或 BV 号，可一次粘贴多个';
+    ? '粘贴小宇宙播客单集链接（xiaoyuzhoufm.com/episode/…），多个用逗号分隔'
+    : '粘贴 B 站视频/合集页链接或 BV 号，多个用逗号分隔';
   $('seasonWrap').hidden = pod;
   $('podHint').hidden = !pod;
   $('searchCard').hidden = pod;
-  setSplit(!pod && searchItems.length > 0);
+  setSplit(!pod);
 }
 
 // 超过 200MB: 询问是否拆分成多个文件上传
@@ -1329,6 +1740,29 @@ function phaseBar(msg) {
   else if (msg.indexOf('正在保存歌曲信息') > -1) w.style.width = '82%';
   else if (msg.indexOf('正在发布到云盘') > -1) w.style.width = '92%';
   else if (msg.indexOf('✓ 上传完成') > -1) w.style.width = '100%';
+}
+// 进度卡重置与上传事件流解析 (音乐页 / 补歌页共用)
+function resetProgress(title) {
+  lastTotal = 0;
+  $('progress').hidden = false;
+  $('running').hidden = false; $('finished').hidden = true;
+  $('pErrs').hidden = true; $('pErrs').textContent = '';
+  $('rawlog').textContent = '';
+  $('pTitle').textContent = title || '正在上传'; $('pNow').textContent = '准备中';
+  $('pCount').textContent = ''; $('pBar').style.width = '3%';
+}
+async function readUploadStream(res, onLine) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream:true });
+    const lines = buf.split('\\n');
+    buf = lines.pop();
+    for (const l of lines) { if (!l.trim()) continue; onLine(JSON.parse(l)); }
+  }
 }
 let biliLogged = false;
 // 账号登录整体收纳到顶栏「账号」按钮, 点开后才显示两端登录状态与扫码
@@ -1462,8 +1896,361 @@ $('list').addEventListener('click', e => {
 // 多链接输入: Enter 提交(Shift+Enter 换行)
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doUpload(); } });
 function uploadBV(bvid) { $('input').value = bvid; doUpload(); }
-// B站搜索: 结果与云盘曲目对照, 已收录的标出来, 可只看未导入的
-let searchItems = [], onlyNew = false;
+
+// ---------- 补歌: 扫描歌单灰歌/VIP歌 → B站找音源 → 补进云盘 ----------
+let graySongs = [], grayGroups = { gray: [], vip: [] }, fixSongs = [], scanTotal = 0, scanPid = '', fixRunning = false;
+const deletedSids = new Set();
+async function loadPlaylists() {
+  const sel = $('plSel');
+  const keep = sel.value;
+  try {
+    const j = await (await fetch('/api/playlists')).json();
+    if (j.error) {
+      sel.innerHTML = '<option value="">' + esc(j.error) + '</option>';
+      if (!graySongs.length) {
+        $('grayList').innerHTML = '<div class="empty">' + esc(j.error)
+          + '<br><button class="mini" data-act="qr">扫码登录网易云</button></div>';
+      }
+      return;
+    }
+    const list = j.playlists || [];
+    if (!list.length) { sel.innerHTML = '<option value="">还没有歌单</option>'; return; }
+    sel.innerHTML = list.map(p => '<option value="' + p.id + '">' + esc(p.name) + '（' + p.count + ' 首）</option>').join('');
+    const saved = keep || localStorage.getItem('bili2ncm.pid') || '';
+    if (saved && list.some(p => String(p.id) === saved)) sel.value = saved;
+  } catch (e) {
+    sel.innerHTML = '<option value="">歌单读取失败</option>';
+  }
+}
+function fmtDur(ms) {
+  const s = Math.round((ms || 0) / 1000), m = Math.floor(s / 60);
+  return m + ':' + String(s % 60).padStart(2, '0');
+}
+let sideLoaded = false;
+let sideRec = [], recPage = 0;
+const REC_PER_PAGE = 5;
+function renderRec() {
+  const total = Math.ceil(sideRec.length / REC_PER_PAGE);
+  if (recPage >= total) recPage = Math.max(0, total - 1);
+  const start = recPage * REC_PER_PAGE;
+  const list = sideRec.slice(start, start + REC_PER_PAGE);
+  $('sideRec').innerHTML = list.length ? list.map(s =>
+    '<div class="side-item"><div class="side-line"><span class="side-name">' + esc(s.name) + '</span>'
+    + (typeof s.score === 'number' ? '<span class="stamp">' + s.score + '% 相似</span>' : '') + '</div>'
+    + '<div class="side-sub">' + esc(s.artist || '未知歌手') + '</div></div>').join('')
+    : '<div class="side-empty">暂无推荐</div>';
+  $('recPager').hidden = total <= 1;
+  $('recPrev').disabled = recPage <= 0;
+  $('recNext').disabled = recPage >= total - 1;
+}
+function flipRec(d) {
+  const total = Math.ceil(sideRec.length / REC_PER_PAGE);
+  const next = recPage + d;
+  if (next < 0 || next >= total) return;
+  recPage = next;
+  renderRec();
+}
+async function loadSide() {
+  if (sideLoaded) return;
+  try {
+    const j = await (await fetch('/api/side')).json();
+    if (j.error) {
+      $('sideLiked').innerHTML = '<div class="side-empty">登录网易云后显示</div>';
+      $('sideRec').innerHTML = '<div class="side-empty">登录网易云后显示</div>';
+      return;
+    }
+    sideLoaded = true;
+    const liked = j.liked || [];
+    $('sideLiked').innerHTML = liked.length ? liked.map(s =>
+      '<div class="side-item"><div class="side-name">' + esc(s.name) + '</div><div class="side-sub">'
+      + esc(s.artist || '未知歌手') + (s.count ? ' · ' + s.count + ' 次' : '') + '</div></div>').join('')
+      : '<div class="side-empty">还没有喜欢的歌</div>';
+    sideRec = j.rec || [];
+    recPage = 0;
+    renderRec();
+  } catch (e) {
+    $('sideLiked').innerHTML = '<div class="side-empty">加载失败</div>';
+    $('sideRec').innerHTML = '<div class="side-empty">加载失败</div>';
+    $('recPager').hidden = true;
+  }
+}
+function durSec(d) {
+  const p = String(d || '0:00').split(':').map(Number);
+  if (p.length === 3) return p[0] * 3600 + p[1] * 60 + p[2];
+  if (p.length === 2) return p[0] * 60 + p[1];
+  return p[0] || 0;
+}
+async function scanGray() {
+  const pid = $('plSel').value;
+  if (!pid) { $('plSel').focus(); return; }
+  const btn = $('scanBtn'), box = $('grayList');
+  btn.disabled = true; btn.textContent = '扫描中';
+  box.innerHTML = '<div class="empty">正在扫描歌单，请稍候…</div>';
+  try {
+    const j = await (await fetch('/api/gray?pid=' + encodeURIComponent(pid))).json();
+    if (j.error) throw new Error(j.error);
+    grayGroups = { gray: j.gray || [], vip: j.vip || [] };
+    graySongs = grayGroups.gray.concat(grayGroups.vip);
+    scanTotal = j.total || 0;
+    scanPid = pid;
+    fixSongs = []; deletedSids.clear(); refreshFixButtons();
+    try { localStorage.setItem('bili2ncm.pid', pid); } catch (e) {}
+    renderFix();
+  } catch (e) {
+    graySongs = [];
+    box.innerHTML = '<div class="empty">' + esc(e.message) + '<br><button onclick="scanGray()">重试</button></div>';
+  }
+  btn.disabled = false; btn.textContent = '开始扫描';
+}
+function rowHtml(s) {
+  return '<div class="gq" data-sid="' + s.id + '"><div class="gq-row">'
+    + '<div class="gq-l"><div class="gq-t">' + esc(s.name) + (s.fee === 1 ? '<span class="badge">VIP</span>' : '') + '</div>'
+    + '<div class="gq-m">' + esc(s.artist) + ' · ' + fmtDur(s.durMs) + '</div></div>'
+    + '<div class="gq-a"><button class="mini" data-act="find">找音源</button></div>'
+    + '</div></div>';
+}
+function renderFix() {
+  const box = $('grayList');
+  const g = grayGroups.gray.filter(s => !deletedSids.has(s.id));
+  const v = grayGroups.vip.filter(s => !deletedSids.has(s.id));
+  if (!g.length && !v.length) {
+    box.innerHTML = '<div class="empty">这个歌单里没有需要补的歌</div>';
+    return;
+  }
+  let html = '<div class="sr-head"><span>共 ' + scanTotal + ' 首 · 暂无音源 ' + g.length + ' · VIP 专属 ' + v.length + '</span>'
+    + '<div class="sr-btns">'
+    + '<button class="mini" id="addLikeBtn" data-pick="add">加入我喜欢的音乐</button>'
+    + '<button class="mini" id="delOrigBtn" data-pick="del">取消爱心</button>'
+    + '</div></div>';
+  if (g.length) html += '<details class="grp"><summary><span class="sum-l"><i class="dot-red"></i>暂无音源 · ' + g.length + ' 首</span><span class="sum-r"><span class="cta-breathe">音源补充</span></span></summary>' + g.map(rowHtml).join('') + '</details>';
+  if (v.length) html += '<details class="grp"><summary><span class="sum-l">VIP 专属 · ' + v.length + ' 首</span></summary>' + v.map(rowHtml).join('') + '</details>';
+  box.innerHTML = html;
+  refreshFixButtons();
+}
+let srcSong = null, srcRow = null;
+function openSrc(song, row) {
+  srcSong = song; srcRow = row;
+  $('srcTitle').textContent = '《' + song.name + '》';
+  $('srcSub').textContent = [song.artist, fmtDur(song.durMs)].filter(Boolean).join(' · ');
+  $('srcList').innerHTML = '<div class="cand-empty">正在 B 站找音源…</div>';
+  $('srcModal').hidden = false;
+  lockScroll();
+}
+function closeSrc() {
+  $('srcModal').hidden = true;
+  lockScroll();
+}
+async function findSources(row, btn) {
+  const song = graySongs.find(s => String(s.id) === row.dataset.sid);
+  if (!song) return;
+  openSrc(song, row);
+  const list = $('srcList');
+  btn.disabled = true; btn.textContent = '搜索中';
+  const kw = [song.name, song.artist].filter(Boolean).join(' ');
+  try {
+    if (!cloudLoaded) await loadList();
+    const j = await (await fetch('/api/search?kw=' + encodeURIComponent(kw))).json();
+    if (j.needLogin) {
+      list.innerHTML = '<div class="cand-empty">需要先登录 B 站<button class="mini" data-act="qr">扫码登录</button></div>';
+      return;
+    }
+    if (j.error) {
+      list.innerHTML = '<div class="cand-empty">B 站搜索被临时限制<button class="mini" data-act="pop" data-kw="' + esc(kw) + '">在页面内搜 B 站</button></div>';
+      return;
+    }
+    // 严格匹配: 时长相差不超过 3 秒且标题包含歌名, 最多 3 条候选
+    const hits = (j.items || []).filter(v =>
+      Math.abs(durSec(v.duration) - (song.durMs || 0) / 1000) <= 3
+      && normName(v.title).indexOf(normName(song.name)) > -1).slice(0, 3);
+    if (!hits.length) {
+      list.innerHTML = '<div class="cand-empty">没有找到时长吻合的音源<button class="mini" data-act="pop" data-kw="' + esc(kw) + '">在页面内搜 B 站</button></div>';
+      return;
+    }
+    list.innerHTML = hits.map(v => {
+      const dup = !!cloudMatch(v.title);
+      return '<div class="cand"><div class="cand-l"><div class="cand-t">' + esc(v.title)
+        + (dup ? '<span class="badge ok">云盘已有</span>' : '') + '</div>'
+        + '<div class="cand-m">' + esc(v.author) + ' · ' + esc(v.duration) + '</div></div>'
+        + '<div class="cand-a"><button class="mini" data-act="preview" data-bv="' + esc(v.bvid) + '" data-song="' + esc(song.name) + '" data-title="' + esc(v.title) + '">试听</button>'
+        + '<button class="mini ' + (dup ? '' : 'primary') + '" data-act="up" data-bv="' + esc(v.bvid) + '">'
+        + (dup ? '仍要补进' : '补进云盘') + '</button>'
+        + '</div></div>';
+    }).join('');
+  } catch (e) {
+    list.innerHTML = '<div class="cand-empty">搜索失败，请稍后再试</div>';
+  } finally {
+    btn.disabled = false; btn.textContent = '找音源';
+  }
+}
+let listenBv = '';
+function openListen(bvid, song, title) {
+  listenBv = bvid;
+  $('listenTitle').textContent = song || title || '试听';
+  $('listenSub').textContent = song ? (title || '') : '';
+  $('listenSub').hidden = !$('listenSub').textContent;
+  $('listenFrame').src = 'https://player.bilibili.com/player.html?bvid=' + encodeURIComponent(bvid) + '&page=1&autoplay=1&danmaku=0&high_quality=1';
+  $('listenModal').hidden = false;
+  lockScroll();
+}
+function closeListen() {
+  $('listenModal').hidden = true;
+  $('listenFrame').src = 'about:blank';
+  lockScroll();
+}
+function openBili() {
+  if (listenBv) window.open('https://www.bilibili.com/video/' + encodeURIComponent(listenBv), '_blank', 'noopener');
+}
+// 点击弹窗外部收起
+$('listenModal').addEventListener('click', e => { if (e.target === $('listenModal')) closeListen(); });
+async function fixUpload(btn, song, row) {
+  if (fixRunning || !song) return;
+  fixRunning = true;
+  btn.disabled = true; btn.textContent = '补齐中';
+  resetProgress('正在补歌');
+  let ok = false;
+  try {
+    const res = await fetch('/api/upload', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: btn.dataset.bv, allPages: false, split: false, clean: false,
+        song: song.name, artist: song.artist }),
+    });
+    await readUploadStream(res, j => {
+      if (j.type === 'done') {
+        const good = (j.results || []).filter(r => r.ok).length;
+        ok = good > 0;
+        $('pBar').style.width = '100%';
+        $('running').hidden = true; $('finished').hidden = false;
+        $('pDone').innerHTML = ok ? '补歌完成<span>已加入云盘</span>' : '补歌失败<span>请查看详细日志</span>';
+        if (ok) {
+          if (row) {
+            row.classList.add('filled');
+            row.querySelector('.gq-t').insertAdjacentHTML('beforeend', '<span class="badge ok">已补</span>');
+            const findBtn = row.querySelector('[data-act="find"]');
+            if (findBtn) { findBtn.disabled = true; findBtn.textContent = '已补'; }
+          }
+          const hit = (j.results || []).find(r => r.ok);
+          if (hit && hit.songId && !fixSongs.some(f => f.sid === song.id)) {
+            fixSongs.push({ sid: song.id, songId: hit.songId, name: song.name, artist: song.artist, added: false, deleted: false });
+            refreshFixButtons();
+          }
+          loadList(); loadHistory();
+        }
+      } else if (j.type === 'error') {
+        $('running').hidden = true; $('finished').hidden = false;
+        step('✗ ' + j.msg, true);
+        $('pDone').innerHTML = j.needSplit
+          ? '补歌失败<span>音频超过 200MB, 无法直接补入云盘</span>'
+          : '补歌失败<span>' + esc(String(j.msg || '').slice(0, 60)) + '</span>';
+      } else {
+        step(j.msg); phaseBar(j.msg);
+      }
+    });
+  } catch (e) {
+    step('✗ ' + e.message, true);
+    $('running').hidden = true; $('finished').hidden = false;
+    $('pDone').innerHTML = '补歌失败<span>' + esc(e.message.slice(0, 60)) + '</span>';
+  }
+  if (ok) { btn.textContent = '已补'; } else { btn.disabled = false; btn.textContent = '补进云盘'; }
+  fixRunning = false;
+}
+// 补完后的批量操作: 弹窗默认全选, 取消勾选即跳过
+let pickMode = '', pickItems = [];
+function refreshFixButtons() {
+  const add = $('addLikeBtn'), del = $('delOrigBtn');
+  if (add) add.classList.toggle('ready', fixSongs.some(f => !f.added));
+  if (del) del.classList.toggle('ready', fixSongs.some(f => !f.deleted));
+}
+function openPick(mode) {
+  if (!fixSongs.length) { toast('先去寻找音源吧'); return; }
+  pickMode = mode;
+  pickItems = fixSongs.filter(f => mode === 'add' ? !f.added : !f.deleted);
+  if (!pickItems.length) {
+    toast(mode === 'add' ? '这些歌已经加入过了' : '没有需要取消爱心的歌');
+    return;
+  }
+  $('pickTitle').textContent = mode === 'add' ? '加入「我喜欢的音乐」' : '取消爱心';
+  $('pickSub').textContent = mode === 'add'
+    ? '下面这些歌已补进云盘，默认全部加入；取消勾选的不加入。'
+    : '默认从当前歌单移出（在「我喜欢的音乐」里就是取消爱心）；取消勾选的不处理。云盘文件不受影响。';
+  $('pickList').innerHTML = pickItems.map((f, i) =>
+    '<label class="pick-row"><input type="checkbox" data-i="' + i + '" checked>'
+    + '<span class="pick-name">' + esc(f.name) + '</span><span class="pick-artist">' + esc(f.artist) + '</span></label>').join('');
+  $('pickAll').checked = true;
+  $('pickYes').disabled = false;
+  $('pickYes').textContent = mode === 'add' ? '确认加入' : '确认取消爱心';
+  $('pickModal').hidden = false;
+  lockScroll();
+}
+function closePick(){ $('pickModal').hidden = true; lockScroll(); }
+// 轻提示
+let toastTimer = 0;
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 2200);
+}
+// 快速上手弹窗: 按当前页面显示对应教程
+function openGuide(){
+  const fix = curTab === 'fix';
+  $('guideTitle').textContent = fix ? '补歌 · 快速上手' : '上传 · 快速上手';
+  $('guideFix').hidden = !fix;
+  $('guideUp').hidden = fix;
+  $('guideModal').hidden = false;
+  lockScroll();
+}
+function closeGuide(){ $('guideModal').hidden = true; lockScroll(); }
+function togglePickAll(on){ $('pickList').querySelectorAll('input[type=checkbox]').forEach(c => { c.checked = on; }); }
+async function confirmPick() {
+  const chosen = Array.from($('pickList').querySelectorAll('input[type=checkbox]'))
+    .filter(c => c.checked).map(c => pickItems[+c.dataset.i]);
+  if (!chosen.length) { closePick(); return; }
+  const mode = pickMode, btn = $('pickYes');
+  const ask = mode === 'add'
+    ? '确认把选中的 ' + chosen.length + ' 首加入「我喜欢的音乐」？'
+    : '确认从当前歌单移出 ' + chosen.length + ' 首（取消爱心）？云盘文件不受影响。';
+  if (!window.confirm(ask)) return;
+  btn.disabled = true; btn.textContent = '处理中';
+  try {
+    const body = mode === 'add'
+      ? { op: 'add', ids: chosen.map(f => f.songId) }
+      : { op: 'del', pid: Number(scanPid), ids: chosen.map(f => f.sid) };
+    const j = await (await fetch('/api/playlist/tracks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
+    if (!j.ok) throw new Error(j.error || '操作失败');
+    if (mode === 'add') {
+      chosen.forEach(f => { f.added = true; });
+      chosen.forEach(f => {
+        const t = document.querySelector('.gq[data-sid="' + f.sid + '"] .gq-t');
+        if (t && !t.querySelector('.badge.ok')) t.insertAdjacentHTML('beforeend', '<span class="badge ok">已加入</span>');
+      });
+    } else {
+      chosen.forEach(f => { f.deleted = true; deletedSids.add(f.sid); });
+      renderFix();
+    }
+    closePick(); refreshFixButtons(); loadList();
+  } catch (e) {
+    btn.disabled = false; btn.textContent = mode === 'add' ? '确认加入' : '确认取消爱心';
+    alert('操作失败: ' + e.message);
+  }
+}
+$('grayList').addEventListener('click', e => {
+  const p = e.target.closest('button[data-pick]');
+  if (p) { openPick(p.dataset.pick); return; }
+  const b = e.target.closest('button[data-act]'); if (!b) return;
+  if (b.dataset.act === 'find') findSources(b.closest('.gq'), b);
+});
+$('srcModal').addEventListener('click', e => {
+  if (e.target === $('srcModal')) { closeSrc(); return; }
+  const b = e.target.closest('button[data-act]'); if (!b) return;
+  const act = b.dataset.act;
+  if (act === 'preview') openListen(b.dataset.bv, b.dataset.song || '', b.dataset.title || '');
+  else if (act === 'up') fixUpload(b, srcSong, srcRow);
+  else if (act === 'qr') { closeSrc(); showQr('bili'); }
+  else if (act === 'pop') { closeSrc(); popSearch(b.dataset.kw); }
+});
+// B站搜索: 结果与云盘曲目对照, 已收录的标出来
+let searchItems = [];
 function normName(s){
   let out = '';
   for (const ch of String(s || '').toLowerCase()) {
@@ -1479,7 +2266,9 @@ function cloudMatch(title) {
   return cloudSongs.find(s => {
     const n = normName(s.name);
     if (!n) return false;
-    return n === t || (n.length >= 2 && t.indexOf(n) > -1);
+    if (n === t) return true;
+    // 仅当云盘歌名足够长且占了标题的大部分时才算同一首, 避免 Live/Remix 版被误判
+    return n.length >= 5 && t.indexOf(n) > -1 && n.length / t.length >= 0.5;
   }) || null;
 }
 function refreshSearchDup() {
@@ -1490,21 +2279,21 @@ function renderSearch() {
   const box = $('sres');
   const total = searchItems.length;
   const dup = searchItems.filter(v => v.cloud).length;
-  const list = onlyNew ? searchItems.filter(v => !v.cloud) : searchItems;
-  setSplit(total > 0);
+  const list = searchItems;
+  setSplit(true);
   const head = '<div class="sr-head"><span>找到 ' + total + ' 首' + (dup ? ' · 云盘已有 ' + dup + ' 首' : '')
-    + '</span><label class="chk"><input type="checkbox" id="onlyNew"' + (onlyNew ? ' checked' : '') + '>只看可导入</label></div>';
+    + '</span></div>';
   if (!list.length) {
     box.innerHTML = head + '<div class="empty">' + (total ? '这些歌云盘里都已经有了' : '没有找到相关内容')
       + '<br><button class="mini" data-act="pop">在页面内搜B站</button></div>';
     return;
   }
-  box.innerHTML = head + '<div id="pv" hidden></div>' + list.map(v =>
+  box.innerHTML = head + list.map(v =>
     '<div class="sr"><div class="sr-l"><div class="sr-t">' + esc(v.title) + (v.cloud ? '<span class="badge">云盘已有</span>' : '') + '</div>'
     + '<div class="sr-m">' + esc(v.author) + ' · ' + esc(v.duration) + ' · ' + fmtPlay(v.play) + '次播放</div></div>'
-    + '<div class="sr-a"><button class="mini" data-act="preview" data-bv="' + esc(v.bvid) + '">试听</button>'
-    + (v.cloud ? '<button class="mini" disabled>已导入</button>'
-      : '<button class="mini" data-act="upload" data-bv="' + esc(v.bvid) + '">上传</button>')
+    + '<div class="sr-a"><button class="mini" data-act="preview" data-bv="' + esc(v.bvid) + '" data-title="' + esc(v.title) + '">试听</button>'
+    + '<button class="mini' + (v.cloud ? '' : ' primary') + '" data-act="upload" data-bv="' + esc(v.bvid) + '">'
+    + (v.cloud ? '仍要上传' : '上传') + '</button>'
     + '</div></div>'
   ).join('');
 }
@@ -1513,39 +2302,35 @@ async function doSearch() {
   if (!kw) { $('skw').focus(); return; }
   const box = $('sres');
   box.hidden = false;
+  $('searchHint').hidden = true;
   if (!biliLogged) { showBiliLoginPrompt(box); return; }
   box.innerHTML = '<div class="empty">搜索中...</div>';
   try {
     if (!cloudLoaded) await loadList();
     const j = await (await fetch('/api/search?kw=' + encodeURIComponent(kw))).json();
     if (j.needLogin) { showBiliLoginPrompt(box); return; }
-    if (j.error) { searchItems = []; setSplit(false); box.innerHTML = '<div class="empty">B站登录可能已过期 <button class="mini" data-act="qr">扫码登录B站</button> <button class="mini" data-act="pop">在页面内搜B站</button></div>'; return; }
+    if (j.error) { searchItems = []; box.innerHTML = '<div class="empty">B站登录可能已过期 <button class="mini" data-act="qr">扫码登录B站</button> <button class="mini" data-act="pop">在页面内搜B站</button></div>'; return; }
     searchItems = (j.items || []).map(v => Object.assign({}, v, { cloud: !!cloudMatch(v.title) }));
     renderSearch();
   } catch (e) {
     searchItems = [];
-    setSplit(false);
     box.innerHTML = '<div class="empty">搜索失败, 请稍后再试 <button class="mini" data-act="pop">在页面内搜B站</button></div>';
   }
 }
 function showBiliLoginPrompt(box) {
   searchItems = [];
-  setSplit(false);
+  $('searchHint').hidden = true;
+  setSplit(true);
   box.innerHTML = '<div class="empty">搜索需要先登录B站<br><button class="mini" data-act="qr">扫码登录B站</button> <button class="mini" data-act="pop">在页面内搜B站</button></div>';
 }
 // 搜索结果按钮统一用事件委托, 避免内联引号在模板字符串中被提前转义
 $('sres').addEventListener('click', e => {
   const b = e.target.closest('button[data-act]'); if (!b) return;
   const act = b.dataset.act;
-  if (act === 'preview') previewBV(b.dataset.bv);
+  if (act === 'preview') openListen(b.dataset.bv, '', b.dataset.title || '');
   else if (act === 'upload') uploadBV(b.dataset.bv);
   else if (act === 'qr') showQr('bili');
   else if (act === 'pop') popSearch();
-});
-$('sres').addEventListener('change', e => {
-  if (e.target.id !== 'onlyNew') return;
-  onlyNew = e.target.checked;
-  renderSearch();
 });
 function fmtPlay(n) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : String(n); }
 // 左右对照: 有搜索结果时把搜索框与音乐云盘并排, 同时查看已有哪些歌
@@ -1555,8 +2340,8 @@ function setSplit(on) {
 }
 // 内嵌B站搜索: 覆盖在本页内, 无需切换窗口; 找到视频复制链接回来粘贴即可
 let bpKw = '';
-function popSearch() {
-  bpKw = $('skw').value.trim();
+function popSearch(kw) {
+  bpKw = kw !== undefined ? String(kw) : $('skw').value.trim();
   $('bpTitle').textContent = bpKw ? 'B站搜索 · ' + bpKw : 'B站搜索';
   $('bpFrame').src = 'https://search.bilibili.com/all?keyword=' + encodeURIComponent(bpKw);
   $('biliPanel').hidden = false;
@@ -1574,77 +2359,91 @@ function closeBiliPanel() {
 }
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
-  if (!$('splitModal').hidden) closeSplit();
+  if (!$('guideModal').hidden) closeGuide();
+  else if (!$('listenModal').hidden) closeListen();
+  else if (!$('srcModal').hidden) closeSrc();
+  else if (!$('pickModal').hidden) closePick();
+  else if (!$('splitModal').hidden) closeSplit();
   else if (!$('accountModal').hidden) closeAccount();
   else if (!$('biliPanel').hidden) closeBiliPanel();
 });
-function previewBV(bvid) {
-  const pv = $('pv');
-  if (pv.dataset.bv === bvid) { pv.hidden = !pv.hidden; if (pv.hidden) pv.innerHTML = ''; return; }
-  pv.dataset.bv = bvid; pv.hidden = false;
-  pv.innerHTML = '<iframe src="https://player.bilibili.com/player.html?bvid=' + bvid + '&autoplay=1&danmaku=0" allowfullscreen></iframe>';
-}
 $('skw').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
+// 从任意文本里提取 B站/小宇宙链接与裸 BV 号(分享文案、多行文本都适用)
+function extractLinks(text) {
+  const s = String(text || '');
+  const urls = (s.match(/https?:\/\/[^\s,，;；]+/g) || [])
+    .map(u => u.replace(/[)\]】。.,，]+$/, ''))
+    .filter(u => /b23\.tv|bilibili\.com|xiaoyuzhoufm\.com/.test(u));
+  const inUrl = new Set();
+  for (const u of urls) for (const b of (u.match(/BV[0-9A-Za-z]{10}/g) || [])) inUrl.add(b.toLowerCase());
+  const bvs = (s.match(/\bBV[0-9A-Za-z]{10}\b/g) || []).filter(b => !inUrl.has(b.toLowerCase()));
+  const seen = new Set(), out = [];
+  for (const x of [...urls, ...bvs]) {
+    const k = x.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k); out.push(x);
+  }
+  return out;
+}
+function splitInput(v) {
+  return String(v || '').split(/[,，\r\n]+/).map(s => s.trim()).filter(Boolean);
+}
+// 粘贴板: 读取剪贴板 → 识别链接 → 去重后按逗号追加到输入框
+async function pasteClipboard() {
+  let text = '';
+  try { text = await navigator.clipboard.readText(); }
+  catch (e) {
+    alert('浏览器不允许直接读取剪贴板，请在输入框里按 Ctrl+V 手动粘贴');
+    return;
+  }
+  const found = extractLinks(text);
+  if (!found.length) { alert('剪贴板里没有找到 B 站链接、BV 号或小宇宙单集链接'); return; }
+  const merged = [...new Set([...splitInput($('input').value), ...found])];
+  $('input').value = merged.join(', ');
+  $('input').focus();
+}
 async function doUpload(split) {
   const input = $('input').value.trim();
   if (!input) { $('input').focus(); return; }
   split = split === true;
   const btn = $('go');
   btn.disabled = true; btn.textContent = '上传中';
-  lastTotal = 0;
-  $('progress').hidden = false;
-  $('running').hidden = false; $('finished').hidden = true;
-  $('pErrs').hidden = true; $('pErrs').textContent = '';
-  $('rawlog').textContent = '';
-  $('pTitle').textContent = split ? '正在拆分上传' : '正在上传'; $('pNow').textContent = '准备中';
-  $('pCount').textContent = ''; $('pBar').style.width = '3%';
+  resetProgress(split ? '正在拆分上传' : '正在上传');
   saveForm();
   try {
     const res = await fetch('/api/upload', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ input, allPages: true, split, season: $('season').checked,
         clean: $('clean').checked, song: $('song').value.trim(), artist: $('artist').value.trim() }) });
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream:true });
-      const lines = buf.split('\\n');
-      buf = lines.pop();
-      for (const l of lines) {
-        if (!l.trim()) continue;
-        const j = JSON.parse(l);
-        if (j.type === 'done') {
-          const ok = j.results.filter(r => r.ok).length;
-          const fails = j.results.filter(r => !r.ok);
-          $('pBar').style.width = '100%';
-          fails.forEach(f => step('✗ ' + f.song + ': ' + f.error, true));
-          $('running').hidden = true; $('finished').hidden = false;
-          $('pDone').innerHTML = '上传完成<span>成功 ' + ok + ' / ' + j.results.length + (fails.length ? ', 失败明细见上方' : ', 已加入云盘') + '</span>';
-          loadList(); loadHistory();
-        } else if (j.type === 'error') {
-          $('running').hidden = true; $('finished').hidden = false;
-          if (j.needSplit) {
-            step('文件超过 200MB, 等待确认是否拆分', true);
-            $('pDone').innerHTML = '需要确认<span>文件超过 200MB</span>';
-            if (!split) openSplit(j.needSplit);
-            else step('✗ 拆分后仍无法上传: ' + j.msg, true);
-          } else {
-            step('✗ ' + j.msg, true);
-            $('pDone').innerHTML = '上传失败<span>请查看错误信息</span>';
-          }
+    await readUploadStream(res, j => {
+      if (j.type === 'done') {
+        const ok = j.results.filter(r => r.ok).length;
+        const fails = j.results.filter(r => !r.ok);
+        $('pBar').style.width = '100%';
+        fails.forEach(f => step('✗ ' + f.song + ': ' + f.error, true));
+        $('running').hidden = true; $('finished').hidden = false;
+        $('pDone').innerHTML = '上传完成<span>成功 ' + ok + ' / ' + j.results.length + (fails.length ? ', 失败明细见上方' : ', 已加入云盘') + '</span>';
+        loadList(); loadHistory();
+      } else if (j.type === 'error') {
+        $('running').hidden = true; $('finished').hidden = false;
+        if (j.needSplit) {
+          step('文件超过 200MB, 等待确认是否拆分', true);
+          $('pDone').innerHTML = '需要确认<span>文件超过 200MB</span>';
+          if (!split) openSplit(j.needSplit);
+          else step('✗ 拆分后仍无法上传: ' + j.msg, true);
         } else {
-          step(j.msg); phaseBar(j.msg);
-          const m = j.msg.match(/\\[(\\d+)\\/(\\d+)\\]/);
-          if (m) {
-            lastTotal = +m[2];
-            setBar(+m[1], +m[2]);
-            $('pTitle').textContent = j.msg.replace(/===\\s*\\[.*?\\]\\s*/, '').replace(/\\s*===\\s*$/, '');
-          }
+          step('✗ ' + j.msg, true);
+          $('pDone').innerHTML = '上传失败<span>请查看错误信息</span>';
+        }
+      } else {
+        step(j.msg); phaseBar(j.msg);
+        const m = j.msg.match(/\\[(\\d+)\\/(\\d+)\\]/);
+        if (m) {
+          lastTotal = +m[2];
+          setBar(+m[1], +m[2]);
+          $('pTitle').textContent = j.msg.replace(/===\\s*\\[.*?\\]\\s*/, '').replace(/\\s*===\\s*$/, '');
         }
       }
-    }
+    });
   } catch (e) {
     step('✗ ' + e.message, true);
     $('running').hidden = true; $('finished').hidden = false;
@@ -1653,7 +2452,13 @@ async function doUpload(split) {
   btn.disabled = false; btn.textContent = '上传';
 }
 restoreForm(); loadStatus(); loadList(); loadHistory();
-try { switchTab(localStorage.getItem('bili2ncm.tab') === 'pod' ? 'pod' : 'music'); } catch (e) { switchTab('music'); }
+try {
+  const savedTab = localStorage.getItem('bili2ncm.tab') || 'fix';
+  const savedType = localStorage.getItem('bili2ncm.type');
+  curType = (savedType === 'pod' || savedTab === 'pod') ? 'pod' : 'music';
+  switchTab(savedTab === 'fix' ? 'fix' : 'up');
+  switchType(curType);
+} catch (e) { switchTab('fix'); }
 </script>
 </body>
 </html>`;
@@ -1947,6 +2752,49 @@ http.createServer((rq, rs) => {
       rs.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
       rs.end(JSON.stringify({ ok: false, error: e.message }));
     }
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/playlists') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    (async () => {
+      try { rs.end(JSON.stringify({ playlists: await ncmPlaylists() })); }
+      catch (e) { rs.end(JSON.stringify({ playlists: [], error: e.message })); }
+    })();
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/side') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    (async () => {
+      try { rs.end(JSON.stringify(await ncmSide())); }
+      catch (e) { rs.end(JSON.stringify({ liked: [], rec: [], error: e.message })); }
+    })();
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/gray') {
+    const pid = (new URL(rq.url, 'http://x').searchParams.get('pid') || '').trim();
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    if (!/^\d+$/.test(pid)) return rs.end(JSON.stringify({ songs: [], total: 0, error: '请选择歌单' }));
+    (async () => {
+      try { rs.end(JSON.stringify(await scanPlaylist(pid))); }
+      catch (e) { rs.end(JSON.stringify({ songs: [], total: 0, error: e.message })); }
+    })();
+    return;
+  }
+  if (rq.method === 'POST' && url === '/api/playlist/tracks') {
+    let body = '';
+    rq.on('data', d => body += d);
+    rq.on('end', async () => {
+      rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      try {
+        const o = JSON.parse(body);
+        const ids = (Array.isArray(o.ids) ? o.ids : []).map(Number).filter(n => Number.isFinite(n) && n > 0).slice(0, 500);
+        if (!ids.length) return rs.end(JSON.stringify({ ok: false, error: '没有选中歌曲' }));
+        const j = await editPlaylistTracks({ op: o.op === 'del' ? 'del' : 'add', pid: o.pid, ids });
+        rs.end(JSON.stringify({ ok: true, playlistId: j.id, count: j.count }));
+      } catch (e) {
+        rs.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
     return;
   }
   if (rq.method === 'GET' && url === '/api/search') {
