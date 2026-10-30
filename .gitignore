@@ -19,6 +19,10 @@ cloud_list_result.txt
 node_modules/
 .DS_Store
 
+# 运行日志
+server.out.log
+server.err.log
+
 # 本地协作工具产物 (设计参考稿/助手记忆, 非项目本体)
 .workbuddy/
 design/
