@@ -1139,6 +1139,8 @@ async function biliUpload(input, opts, send) {
         results.push({ page: pg.page, song: up.song, songId: up.songId, ok: true, instant: up.instant });
         appendHistory({ bvid, page: pg.page, song: up.song, artist, songId: up.songId, size: up.size || buf.length });
       });
+      // 此时已知本段音频精确时长(pg.duration), 是挑对歌词版本的最佳时机
+      if (ups.length === 1 && pg.duration > 0) indexLyricForSong(songName, artist, pg.duration, send);
       send(`✓ 上传完成${ups.every(up => up.instant) ? ' (秒传)' : ''}${ups.length > 1 ? `, 共 ${ups.length} 段` : ''}`);
     } catch (e) {
       if (e.needSplit) throw e;
@@ -1163,6 +1165,15 @@ async function biliUpload(input, opts, send) {
 // 网易云不上报 TimelineProperties, 因此真实进度由前端"锚点+计时"推算。
 let smProc = null, smKillTimer = null, smLastUse = 0;
 let smState = { playing: false, title: '', artist: '', status: 'none' };
+let pushState = null;
+let pushLogged = false;
+function pushFresh() { return !!pushState && Date.now() - pushState.atMs < 5000; }
+function pushLivePos(now) {
+  const base = Number(pushState.pos) || 0;
+  if (pushState.status === 'Paused') return base;
+  return base + Math.max(0, now - (Number(pushState.posAt) || now));
+}
+
 const SM_PS = [
   '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
   '$OutputEncoding = [System.Text.Encoding]::UTF8',
@@ -1172,16 +1183,34 @@ const SM_PS = [
   'function Await($op, $t) { $task = $g.MakeGenericMethod($t).Invoke($null, @($op)); $task.Wait(-1) | Out-Null; $task.Result }',
   'while ($true) {',
   "  $line = '{\"playing\":false,\"title\":\"\",\"artist\":\"\",\"status\":\"none\"}'",
+  '  $got = $false',
   '  try {',
   '    $mgr = Await ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media.Control,ContentType=WindowsRuntime]::RequestAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])',
   '    foreach ($s in $mgr.GetSessions()) {',
   "      if ($s.SourceAppUserModelId -notmatch 'cloudmusic') { continue }",
   '      $pr = Await ($s.TryGetMediaPropertiesAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties])',
   '      $st = [string]$s.GetPlaybackInfo().PlaybackStatus',
-  "      $line = (@{ playing = ($st -eq 'Playing'); title = [string]$pr.Title; artist = [string]$pr.Artist; status = $st } | ConvertTo-Json -Compress)",
+  '      $pos = -1',
+  '      $dur = 0',
+  '      try { $pos = $s.GetTimelineProperties().Position.TotalSeconds; $dur = $s.GetTimelineProperties().EndTime.TotalSeconds } catch { }',
+  "      $line = (@{ playing = ($st -eq 'Playing'); title = [string]$pr.Title; artist = [string]$pr.Artist; status = $st; src = 'smtc'; pos = $pos; dur = $dur } | ConvertTo-Json -Compress)",
+  '      $got = $true',
   '      break',
   '    }',
   '  } catch { }',
+  '  # fallback: when no SMTC session is found, read the main window title (Song - Artist)',
+  '  if (-not $got) {',
+  '    $p = Get-Process cloudmusic -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle } | Select-Object -First 1',
+  '    if ($p) {',
+  '      $wt = [string]$p.MainWindowTitle',
+  '      if ($wt) {',
+  "        $parts = @($wt -split ' - ')",
+  '        if ($parts.Count -ge 2) {',
+  "          $line = (@{ playing = $true; title = $parts[0]; artist = $parts[1]; status = 'Playing'; src = 'title' } | ConvertTo-Json -Compress)",
+  '        }',
+  '      }',
+  '    }',
+  '  }',
   '  Write-Output $line',
   '  Start-Sleep -Milliseconds 500',
   '}',
@@ -1189,6 +1218,7 @@ const SM_PS = [
 
 function ensureSmWatcher() {
   smLastUse = Date.now();
+  if (pushFresh()) return; // 插件已在推送真实进度, 不必再拉起 PowerShell 轮询
   if (smProc) return;
   const p = path.join(os.tmpdir(), 'grayicu_smtc.ps1');
   try { fs.writeFileSync(p, SM_PS, 'utf8'); } catch (e) { return; }
@@ -1205,7 +1235,13 @@ function ensureSmWatcher() {
       if (!t.startsWith('{')) continue;
       try {
         const o = JSON.parse(t);
-        smState = { playing: !!o.playing, title: String(o.title || ''), artist: String(o.artist || ''), status: String(o.status || 'none') };
+        smState = {
+          playing: !!o.playing, title: String(o.title || ''), artist: String(o.artist || ''),
+          status: String(o.status || 'none'), src: String(o.src || ''),
+          pos: Number.isFinite(o.pos) && o.pos >= 0 ? Number(o.pos) : -1,
+          dur: Number.isFinite(o.dur) && o.dur > 0 ? Number(o.dur) : 0,
+          posAt: Date.now() / 1000,
+        };
       } catch (e) {}
     }
   });
@@ -1222,7 +1258,300 @@ function ensureSmWatcher() {
   }
 }
 
+
+// ---------- 桥接插件: 源码内嵌, 一键写入 BetterNCM 插件目录 ----------
+const BRIDGE_MANIFEST = "{\n  \"$schema\": \"https://raw.githubusercontent.com/BetterNCM/BetterNCM-Plugins/refs/heads/master/manifest-schema.json\",\n  \"manifest_version\": 1,\n  \"name\": \"ICU Bridge\",\n  \"version\": \"1.0.0\",\n  \"author\": \"bili2ncm\",\n  \"ncm3-compatible\": true,\n  \"description\": \"把网易云当前歌曲与播放进度推送到本地 bili2ncm（实时歌词桥）\",\n  \"betterncm_version\": \">=1.0.0\",\n  \"injects\": {\n    \"Main\": [\n      {\n        \"file\": \"main.js\"\n      }\n    ]\n  }\n}";
+const BRIDGE_JS_B64 = 'LyogSUNVIEJyaWRnZSDigJQg572R5piT5LqRIOKGkiBiaWxpMm5jbSDmnKzlnLDmrYzor43moaUKICoKICog5Y6f55CGKOenu+akjeiHqiBJbmZMaW5rLXJzIOWJjeerr+mDqOWIhiwg5pegIFJ1c3Qg5L6d6LWWKToKICogICAxLiDnlKggd2VicGFja0pzb25wIOazqOWFpeWBh+aooeWdlywg5ou/5Yiw572R5piT5LqR5YaF6YOo55qEIHdlYnBhY2sgcmVxdWlyZTsKICogICAyLiDlnKjmqKHlnZfnvJPlrZjph4zmib7liLDnp4HmnInnmoQgQnJpZGdlKE9ycGhldXNDb21tYW5kKSDlrp7kvos7CiAqICAgMy4g5LulICJhdWRpb3BsYXllciIg5ZG95ZCN56m66Ze05ZCRIEJyaWRnZSDov73liqAgUGxheVByb2dyZXNzIC8gUGxheVN0YXRlIC8gU2VlayDlm57osIMsCiAqICAgICAg6L+Z5qC35pei5ou/5Yiw55yf5a6e5pKt5pS+6L+b5bqmLCDlj4jkuI3kvJrpobbmjonlrqLmiLfnq6/oh6rlt7HnmoTov5vluqbmnaHnm5HlkKw7CiAqICAgNC4g5om+5YiwIGR2YSDnmoQgUmVkdXggc3RvcmUsIOS7jiBzdGF0ZS5wbGF5aW5nIOivu+WPlueyvuehruWFg+aVsOaNrijmrYzlkI0v5q2M5omLL+S4k+i+kS/mrYzmm7JJRC/ml7bplb8pOwogKiAgIDUuIOS7peavj+enkuS4jei2hei/hyAxIOasoeeahOmikeeOhyBQT1NUIOWIsCBodHRwOi8vMTI3LjAuMC4xOjMyMTAvYXBpL3B1c2jjgIIKICovCihmdW5jdGlvbiAoKSB7CglpZiAod2luZG93Ll9faWN1QnJpZGdlTG9hZGVkKSByZXR1cm47Cgl3aW5kb3cuX19pY3VCcmlkZ2VMb2FkZWQgPSB0cnVlOwoKCXZhciBUQUcgPSAnW0lDVS1CcmlkZ2VdJzsKCXZhciBQVVNIID0gJ2h0dHA6Ly8xMjcuMC4wLjE6MzIxMC9hcGkvcHVzaCc7Cgl2YXIgTlMgPSAnYXVkaW9wbGF5ZXInOwoKCWZ1bmN0aW9uIGxvZygpIHsKCQl0cnkgewoJCQljb25zb2xlLmxvZy5hcHBseShjb25zb2xlLCBbVEFHXS5jb25jYXQoW10uc2xpY2UuY2FsbChhcmd1bWVudHMpKSk7CgkJfSBjYXRjaCAoZSkge30KCX0KCgl2YXIgUyA9IHsKCQl0aXRsZTogJycsCgkJYXJ0aXN0OiAnJywKCQlhbGJ1bTogJycsCgkJbmNtSWQ6IDAsCgkJZHVyOiAwLAoJCXBvczogMCwKCQlwbGF5aW5nOiBmYWxzZSwKCQlrbm93bjogZmFsc2UsCgkJdHJhY2tJZDogJycKCX07Cgl2YXIgc3RvcmUgPSBudWxsOwoJdmFyIGxhc3RTZW50ID0gMDsKCXZhciBtaXNzTWV0YSA9IDA7CgoJLy8gLS0tLS0tLS0tLSB3ZWJwYWNrIC0tLS0tLS0tLS0KCWZ1bmN0aW9uIGdldFJlcXVpcmUoKSB7CgkJcmV0dXJuIG5ldyBQcm9taXNlKGZ1bmN0aW9uIChyZXNvbHZlKSB7CgkJCXZhciBpZCA9ICdfX2ljdWJyaWRnZV9fJyArIERhdGUubm93KCk7CgkJCXZhciB0cmllcyA9IDA7CgkJCXZhciBtb2QgPSB7fTsKCQkJbW9kW2lkXSA9IGZ1bmN0aW9uIChtLCBlLCByKSB7CgkJCQlyZXNvbHZlKHIpOwoJCQl9OwoJCQkoZnVuY3Rpb24gcG9sbCgpIHsKCQkJCXZhciB3ID0gd2luZG93LndlYnBhY2tKc29ucDsKCQkJCWlmICh3ICYmIHR5cGVvZiB3LnB1c2ggPT09ICdmdW5jdGlvbicpIHsKCQkJCQl0cnkgewoJCQkJCQlpZiAod1swXSAmJiBBcnJheS5pc0FycmF5KHdbMF0pKSB7CgkJCQkJCQl3LnB1c2goW1tpZF0sIG1vZCwgW1tpZF1dXSk7CgkJCQkJCX0gZWxzZSB7CgkJCQkJCQl3LnB1c2goW1tpZF0sIG1vZF0pOwoJCQkJCQl9CgkJCQkJCXJldHVybjsKCQkJCQl9IGNhdGNoIChlKSB7CgkJCQkJCWxvZygn5rOo5YWl5YGH5qih5Z2X5aSx6LSlJywgZSk7CgkJCQkJfQoJCQkJfQoJCQkJaWYgKCsrdHJpZXMgPiAyNDApIHsKCQkJCQlsb2coJ3dlYnBhY2tKc29ucCDkuI3lj6/nlKgsIOahpeaOpeacquWQr+WKqCcpOwoJCQkJCXJldHVybiByZXNvbHZlKG51bGwpOwoJCQkJfQoJCQkJc2V0VGltZW91dChwb2xsLCAyNTApOwoJCQl9KSgpOwoJCX0pOwoJfQoKCWZ1bmN0aW9uIGZpbmQocmVxLCB0ZXN0KSB7CgkJaWYgKCFyZXEgfHwgIXJlcS5jKSByZXR1cm4gbnVsbDsKCQlmb3IgKHZhciBrIGluIHJlcS5jKSB7CgkJCXZhciBtID0gcmVxLmNba107CgkJCWlmICghbSB8fCAhbS5leHBvcnRzKSBjb250aW51ZTsKCQkJdmFyIHJhdyA9IG0uZXhwb3J0czsKCQkJdmFyIGV4ID0gcmF3ICYmIHJhdy5kZWZhdWx0ID8gcmF3LmRlZmF1bHQgOiByYXc7CgkJCWlmIChleCAmJiB0ZXN0KGV4KSkgcmV0dXJuIGV4OwoJCX0KCQlyZXR1cm4gbnVsbDsKCX0KCglmdW5jdGlvbiBmaW5kQnJpZGdlKHJlcSkgewoJCS8vIOe9keaYk+S6keWGhemDqOacieWFqOWxgCBsZWdhY3lOYXRpdmVDbWRlciDkuI7np4HmnIkgQnJpZGdlIOS4pOS7veWunuS+izsKCQkvLyDlv4XpobvnlKjnp4HmnIkgQnJpZGdlLCDms6jlhozliLDlhajlsYDkvJropobnm5blrqLmiLfnq6/oh6rlt7HnmoTnm5HlkKzlr7zoh7Tov5vluqbmnaHpnZnmraIKCQl2YXIgZXggPSBmaW5kKHJlcSwgZnVuY3Rpb24gKG0pIHsKCQkJcmV0dXJuICEhKG0uQnJpZGdlICYmIHR5cGVvZiBtLkJyaWRnZS5hcHBlbmRSZWdpc3RlckNhbGwgPT09ICdmdW5jdGlvbicgJiYgdHlwZW9mIG0uQnJpZGdlLmNhbGwgPT09ICdmdW5jdGlvbicpOwoJCX0pOwoJCXJldHVybiBleCA/IGV4LkJyaWRnZSA6IG51bGw7Cgl9CgoJZnVuY3Rpb24gZmluZFN0b3JlKHJlcSkgewoJCXZhciBleCA9IGZpbmQocmVxLCBmdW5jdGlvbiAobSkgewoJCQlyZXR1cm4gISEobS5hICYmIHR5cGVvZiBtLmEgPT09ICdvYmplY3QnICYmIHR5cGVvZiBtLmEuZ2V0U3RvcmUgPT09ICdmdW5jdGlvbicpOwoJCX0pOwoJCWlmICghZXgpIHJldHVybiBudWxsOwoJCXZhciBhcHAgPSBleC5hLmFwcDsKCQlpZiAoYXBwICYmIGFwcC5fc3RvcmUgJiYgdHlwZW9mIGFwcC5fc3RvcmUuZ2V0U3RhdGUgPT09ICdmdW5jdGlvbicpIHJldHVybiBhcHAuX3N0b3JlOwoJCXRyeSB7CgkJCXZhciBzdCA9IGV4LmEuZ2V0U3RvcmUoKTsKCQkJaWYgKHN0ICYmIHR5cGVvZiBzdC5nZXRTdGF0ZSA9PT0gJ2Z1bmN0aW9uJykgcmV0dXJuIHN0OwoJCX0gY2F0Y2ggKGUpIHt9CgkJcmV0dXJuIG51bGw7Cgl9CgoJLy8gLS0tLS0tLS0tLSDlhYPmlbDmja4gLS0tLS0tLS0tLQoJZnVuY3Rpb24gcHVsbE1ldGEoKSB7CgkJaWYgKCFzdG9yZSkgcmV0dXJuOwoJCXRyeSB7CgkJCXZhciBzdCA9IHN0b3JlLmdldFN0YXRlKCkgfHwge307CgkJCXZhciBwID0gc3QucGxheWluZyB8fCB7fTsKCQkJdmFyIHRpZCA9IHAucmVzb3VyY2VUcmFja0lkID8gU3RyaW5nKHAucmVzb3VyY2VUcmFja0lkKSA6ICcnOwoJCQlpZiAoIXRpZCkgewoJCQkJLy8g6L+e57utIDEwIOenkumDveayoeacieW9k+WJjeabsuebriDihpIg6KeG5Li65YGc5q2i5pKt5pS+LCDkuLvliqjmuIXnqbosIOWFjeW+l+acjeWKoeerr+S4gOebtOaYvuekuuaXp+atjAoJCQkJbWlzc01ldGErKzsKCQkJCWlmIChTLmtub3duICYmIG1pc3NNZXRhID49IDEwKSB7CgkJCQkJUy5rbm93biA9IGZhbHNlOyBTLnRpdGxlID0gJyc7IFMuYXJ0aXN0ID0gJyc7IFMuYWxidW0gPSAnJzsKCQkJCQlTLm5jbUlkID0gMDsgUy50cmFja0lkID0gJyc7IFMucG9zID0gMDsgUy5kdXIgPSAwOwoJCQkJCXBvc3QoSlNPTi5zdHJpbmdpZnkoeyB0aXRsZTogJycsIGFydGlzdDogJycsIGFsYnVtOiAnJywgbmNtSWQ6IDAsIHBvczogMCwgZHVyOiAwLCBzdGF0dXM6ICdub25lJywgdDogRGF0ZS5ub3coKSB9KSk7CgkJCQl9CgkJCQlyZXR1cm47CgkJCX0KCQkJbWlzc01ldGEgPSAwOwoKCQkJdmFyIGFydGlzdHMgPSBBcnJheS5pc0FycmF5KHAucmVzb3VyY2VBcnRpc3RzKSA/IHAucmVzb3VyY2VBcnRpc3RzIDogW107CgkJCXZhciBuYW1lID0gU3RyaW5nKHAucmVzb3VyY2VOYW1lIHx8ICcnKTsKCQkJdmFyIGFydGlzdCA9IGFydGlzdHMubWFwKGZ1bmN0aW9uIChhKSB7IHJldHVybiBhICYmIGEubmFtZSA/IGEubmFtZSA6ICcnOyB9KS5maWx0ZXIoQm9vbGVhbikuam9pbignIC8gJyk7CgkJCXZhciBhbGJ1bSA9ICcnOwoJCQl2YXIgY3VyID0gcC5jdXJUcmFjayB8fCBudWxsOwoJCQlpZiAoY3VyICYmIGN1ci5hbGJ1bSkgYWxidW0gPSBTdHJpbmcoY3VyLmFsYnVtLmFsYnVtTmFtZSB8fCBjdXIuYWxidW0ubmFtZSB8fCAnJyk7CgkJCWlmICghYWxidW0pIGFsYnVtID0gU3RyaW5nKHAucmVzb3VyY2VBbGJ1bU5hbWUgfHwgJycpOwoJCQl2YXIgZHVyTXMgPSBjdXIgJiYgdHlwZW9mIGN1ci5kdXJhdGlvbiA9PT0gJ251bWJlcicgPyBjdXIuZHVyYXRpb24gOiAwOwoKCQkJaWYgKHRpZCAhPT0gUy50cmFja0lkKSB7CgkJCQlTLnRyYWNrSWQgPSB0aWQ7CgkJCQlTLnBvcyA9IDA7CgkJCX0KCQkJdmFyIG9ubGluZSA9IHAub25saW5lUmVzb3VyY2VJZCA/IFN0cmluZyhwLm9ubGluZVJlc291cmNlSWQpIDogdGlkOwoJCQl2YXIgZGlnaXRzID0gb25saW5lLm1hdGNoKC9cZCsvKTsKCQkJUy50aXRsZSA9IG5hbWUgfHwgUy50aXRsZTsKCQkJUy5hcnRpc3QgPSBhcnRpc3QgfHwgUy5hcnRpc3Q7CgkJCVMuYWxidW0gPSBhbGJ1bTsKCQkJUy5uY21JZCA9IGRpZ2l0cyA/IHBhcnNlSW50KGRpZ2l0c1swXSwgMTApIDogMDsKCQkJaWYgKGR1ck1zID4gMCkgUy5kdXIgPSBkdXJNcyAvIDEwMDA7CgkJCVMua25vd24gPSB0cnVlOwoJCQlTLnBsYXlpbmcgPSBwLnBsYXlpbmdTdGF0ZSA9PT0gMjsKCQl9IGNhdGNoIChlKSB7CgkJCWxvZygn6K+75Y+WIFJlZHV4IOWFg+aVsOaNruWksei0pScsIGUpOwoJCX0KCX0KCgkvLyAtLS0tLS0tLS0tIOi/m+W6puS6i+S7tiAtLS0tLS0tLS0tCglmdW5jdGlvbiBpc0N1cnJlbnQocGxheUlkKSB7CgkJaWYgKCFwbGF5SWQpIHJldHVybiB0cnVlOwoJCWlmICghUy50cmFja0lkKSByZXR1cm4gdHJ1ZTsKCQlwbGF5SWQgPSBTdHJpbmcocGxheUlkKTsKCQl2YXIgc2VwID0gcGxheUlkLnNlYXJjaCgvW198XS8pOwoJCXZhciBldklkID0gc2VwID49IDAgPyBwbGF5SWQuc2xpY2UoMCwgc2VwKSA6IHBsYXlJZDsKCQlpZiAoZXZJZC50b0xvd2VyQ2FzZSgpID09PSBTLnRyYWNrSWQudG9Mb3dlckNhc2UoKSkgcmV0dXJuIHRydWU7CgkJaWYgKHBsYXlJZC50b0xvd2VyQ2FzZSgpLmluZGV4T2YoUy50cmFja0lkLnRvTG93ZXJDYXNlKCkgKyAnXycpID09PSAwKSByZXR1cm4gdHJ1ZTsKCQlpZiAoUy5uY21JZCAmJiBldklkID09PSBTdHJpbmcoUy5uY21JZCkpIHJldHVybiB0cnVlOwoJCXJldHVybiBmYWxzZTsKCX0KCgkvLyDljp/nlJ/ovb3ojbc6IFtwbGF5SWQsIHJlc3VtZU9yUGF1c2VJZCwgc3RhdGVdICBzdGF0ZSAxPeaSreaUviAyPeaaguWBnCAzPemUmeivryAwLzQ95YGc5q2iCglmdW5jdGlvbiBvblBsYXlTdGF0ZShwbGF5SWQsIHJlc3VtZU9yUGF1c2VJZCwgc3RhdGUpIHsKCQlpZiAoc3RhdGUgPT09IDMpIHJldHVybjsKCQl2YXIgcGxheWluZzsKCQlpZiAoc3RhdGUgPT09IDEpIHBsYXlpbmcgPSB0cnVlOwoJCWVsc2UgaWYgKHN0YXRlID09PSAwIHx8IHN0YXRlID09PSAyIHx8IHN0YXRlID09PSA0KSBwbGF5aW5nID0gZmFsc2U7CgkJZWxzZSByZXR1cm47CgkJaWYgKFMucGxheWluZyAhPT0gcGxheWluZykgewoJCQlTLnBsYXlpbmcgPSBwbGF5aW5nOwoJCQlwdWxsTWV0YSgpOwoJCQlzZW5kKHRydWUpOwoJCX0KCX0KCgkvLyBbcGxheUlkLCBjdXJyZW50U2Vjb25kcywgY2FjaGVQcm9ncmVzcywgZm9yY2VdCglmdW5jdGlvbiBvblByb2dyZXNzKHBsYXlJZCwgY3VycmVudFNlY29uZHMpIHsKCQlpZiAoIWlzQ3VycmVudChwbGF5SWQpKSByZXR1cm47CgkJdmFyIHNlYyA9IE51bWJlcihjdXJyZW50U2Vjb25kcyk7CgkJaWYgKCFpc0Zpbml0ZShzZWMpIHx8IHNlYyA8IDApIHJldHVybjsKCQlTLnBvcyA9IHNlYzsKCQlzZW5kKGZhbHNlKTsKCX0KCgkvLyBbcGxheUlkLCBzZWVrSWQsIGNvZGUsIHBvc2l0aW9uU2Vjb25kc10KCWZ1bmN0aW9uIG9uU2VlayhwbGF5SWQsIHNlZWtJZCwgY29kZSwgcG9zaXRpb24pIHsKCQlpZiAoIWlzQ3VycmVudChwbGF5SWQpKSByZXR1cm47CgkJdmFyIHNlYyA9IE51bWJlcihwb3NpdGlvbik7CgkJaWYgKCFpc0Zpbml0ZShzZWMpIHx8IHNlYyA8IDApIHJldHVybjsKCQlTLnBvcyA9IHNlYzsKCQlzZW5kKHRydWUpOwoJfQoKCS8vIOWFnOW6lTog55SoIEF1ZGlvUGxheWVyIOeahOmrmOe6p+iuoumYheaOpeWPoyjkuI3norAgQnJpZGdlKQoJZnVuY3Rpb24gYmluZEF1ZGlvUGxheWVyKHJlcSkgewoJCXZhciBleCA9IGZpbmQocmVxLCBmdW5jdGlvbiAobSkgewoJCQlyZXR1cm4gISEobS5BdWRpb1BsYXllciAmJiB0eXBlb2YgbS5BdWRpb1BsYXllci5zdWJzY3JpYmVQbGF5U3RhdHVzID09PSAnZnVuY3Rpb24nKTsKCQl9KTsKCQlpZiAoIWV4KSByZXR1cm4gZmFsc2U7CgkJdmFyIFAgPSBleC5BdWRpb1BsYXllcjsKCQl0cnkgewoJCQlQLnN1YnNjcmliZVBsYXlTdGF0dXMoewoJCQkJdHlwZTogJ3BsYXlwcm9ncmVzcycsCgkJCQljYWxsYmFjazogZnVuY3Rpb24gKGkpIHsKCQkJCQlpZiAoaSAmJiBpc0N1cnJlbnQoaS5wbGF5SWQpKSB7CgkJCQkJCVMucG9zID0gTnVtYmVyKGkuY3VycmVudCkgfHwgMDsKCQkJCQkJc2VuZChmYWxzZSk7CgkJCQkJfQoJCQkJfQoJCQl9KTsKCQkJUC5zdWJzY3JpYmVQbGF5U3RhdHVzKHsKCQkJCXR5cGU6ICdwbGF5c3RhdGUnLAoJCQkJY2FsbGJhY2s6IGZ1bmN0aW9uIChpKSB7CgkJCQkJaWYgKCFpKSByZXR1cm47CgkJCQkJdmFyIHN0ID0gU3RyaW5nKGkuc3RhdGUgfHwgJycpOwoJCQkJCWlmIChzdCA9PT0gJ3BsYXknIHx8IHN0ID09PSAncmVzdW1lJykgUy5wbGF5aW5nID0gdHJ1ZTsKCQkJCQllbHNlIGlmIChzdCA9PT0gJ3BhdXNlJyB8fCBzdCA9PT0gJ2VuZCcpIFMucGxheWluZyA9IGZhbHNlOwoJCQkJCXNlbmQodHJ1ZSk7CgkJCQl9CgkJCX0pOwoJCQlQLnN1YnNjcmliZVBsYXlTdGF0dXMoewoJCQkJdHlwZTogJ3NlZWsnLAoJCQkJY2FsbGJhY2s6IGZ1bmN0aW9uIChpKSB7CgkJCQkJaWYgKGkgJiYgaXNDdXJyZW50KGkucGxheUlkKSkgewoJCQkJCQlTLnBvcyA9IE51bWJlcihpLnBvc2l0aW9uKSB8fCAwOwoJCQkJCQlzZW5kKHRydWUpOwoJCQkJCX0KCQkJCX0KCQkJfSk7CgkJCXJldHVybiB0cnVlOwoJCX0gY2F0Y2ggKGUpIHsKCQkJbG9nKCdBdWRpb1BsYXllciDorqLpmIXlpLHotKUnLCBlKTsKCQkJcmV0dXJuIGZhbHNlOwoJCX0KCX0KCgkvLyAtLS0tLS0tLS0tIOS4iuaKpSAtLS0tLS0tLS0tCglmdW5jdGlvbiBwb3N0KGJvZHkpIHsKCQl0cnkgewoJCQlpZiAodHlwZW9mIGZldGNoID09PSAnZnVuY3Rpb24nKSB7CgkJCQkvLyBuby1jb3JzICsgdGV4dC9wbGFpbjog566A5Y2V6K+35rGCLCDkuI3op6blj5HpooTmo4AKCQkJCWZldGNoKFBVU0gsIHsKCQkJCQltZXRob2Q6ICdQT1NUJywKCQkJCQltb2RlOiAnbm8tY29ycycsCgkJCQkJaGVhZGVyczogeyAnQ29udGVudC1UeXBlJzogJ3RleHQvcGxhaW4nIH0sCgkJCQkJYm9keTogYm9keQoJCQkJfSkuY2F0Y2goZnVuY3Rpb24gKCkge30pOwoJCQkJcmV0dXJuOwoJCQl9CgkJfSBjYXRjaCAoZSkge30KCQl0cnkgewoJCQl2YXIgeCA9IG5ldyBYTUxIdHRwUmVxdWVzdCgpOwoJCQl4Lm9wZW4oJ1BPU1QnLCBQVVNILCB0cnVlKTsKCQkJeC5zZXRSZXF1ZXN0SGVhZGVyKCdDb250ZW50LVR5cGUnLCAndGV4dC9wbGFpbicpOwoJCQl4LnNlbmQoYm9keSk7CgkJfSBjYXRjaCAoZSkgewoJCQlsb2coJ+S4iuaKpeWksei0pScsIGUpOwoJCX0KCX0KCglmdW5jdGlvbiBzZW5kKGZvcmNlKSB7CgkJdmFyIG5vdyA9IERhdGUubm93KCk7CgkJaWYgKCFmb3JjZSAmJiBub3cgLSBsYXN0U2VudCA8IDQwMCkgcmV0dXJuOwoJCWlmICghUy5rbm93bikgcmV0dXJuOwoJCWxhc3RTZW50ID0gbm93OwoJCXBvc3QoSlNPTi5zdHJpbmdpZnkoewoJCQl0aXRsZTogUy50aXRsZSwKCQkJYXJ0aXN0OiBTLmFydGlzdCwKCQkJYWxidW06IFMuYWxidW0sCgkJCW5jbUlkOiBTLm5jbUlkLAoJCQlwb3M6IE1hdGgucm91bmQoUy5wb3MgKiAxMDApIC8gMTAwLAoJCQlkdXI6IE1hdGgucm91bmQoUy5kdXIgKiAxMDApIC8gMTAwLAoJCQlzdGF0dXM6IFMucGxheWluZyA/ICdQbGF5aW5nJyA6ICdQYXVzZWQnLAoJCQl0OiBub3cKCQl9KSk7Cgl9CgoJLy8gLS0tLS0tLS0tLSDlkK/liqggLS0tLS0tLS0tLQoJZ2V0UmVxdWlyZSgpLnRoZW4oZnVuY3Rpb24gKHJlcSkgewoJCWlmICghcmVxKSByZXR1cm47CgkJc3RvcmUgPSBmaW5kU3RvcmUocmVxKTsKCQlpZiAoc3RvcmUpIGxvZygn5bey6L+e5o6l572R5piT5LqRIFJlZHV4IHN0b3JlJyk7CgoJCXZhciBicmlkZ2UgPSBmaW5kQnJpZGdlKHJlcSk7CgkJaWYgKGJyaWRnZSkgewoJCQl0cnkgewoJCQkJYnJpZGdlLmFwcGVuZFJlZ2lzdGVyQ2FsbCgnUGxheVN0YXRlJywgTlMsIG9uUGxheVN0YXRlKTsKCQkJCWJyaWRnZS5hcHBlbmRSZWdpc3RlckNhbGwoJ1BsYXlQcm9ncmVzcycsIE5TLCBvblByb2dyZXNzKTsKCQkJCWJyaWRnZS5hcHBlbmRSZWdpc3RlckNhbGwoJ1NlZWsnLCBOUywgb25TZWVrKTsKCQkJCWxvZygn5bey5oyC5o6l5YaF6YOoIEJyaWRnZSDmkq3mlL7kuovku7YnKTsKCQkJfSBjYXRjaCAoZSkgewoJCQkJbG9nKCfms6jlhowgQnJpZGdlIOS6i+S7tuWksei0pScsIGUpOwoJCQkJYnJpZGdlID0gbnVsbDsKCQkJfQoJCX0KCQlpZiAoIWJyaWRnZSAmJiAhYmluZEF1ZGlvUGxheWVyKHJlcSkpIHsKCQkJbG9nKCfml6Dms5XorqLpmIXmkq3mlL7kuovku7YsIOS7heS4iuaKpeWFg+aVsOaNricpOwoJCX0KCgkJcHVsbE1ldGEoKTsKCQlzZW5kKHRydWUpOwoJCXNldEludGVydmFsKGZ1bmN0aW9uICgpIHsKCQkJaWYgKCFzdG9yZSkgc3RvcmUgPSBmaW5kU3RvcmUocmVxKTsKCQkJcHVsbE1ldGEoKTsKCQkJLy8g5pKt5pS+5Lit5q+P56eS6KGl5LiA5qyhKOi/m+W6puS6i+S7tuWBtuWPkee8uuWkseaXtuWFnOW6lSksIOaaguWBnOaXtuWPquS/nea0uwoJCQlzZW5kKHRydWUpOwoJCX0sIDEwMDApOwoJfSk7Cn0pKCk7Cg==';
+const BRIDGE_PLUGIN_DIR = 'C:\\betterncm\\plugins';
+const BRIDGE_PLUGIN_PATH = path.join(BRIDGE_PLUGIN_DIR, 'icu-bridge.plugin');
+
+// ---------- 网易云 CDP 直连: 不用 BetterNCM 插件也能拿到真实进度 ----------
+// DevTools 端口只能在进程启动那一刻打开, 所以网易云必须带 --remote-debugging-port 启动;
+// 这里负责"注入同一段桥接代码 + 需要时重启网易云", 没端口时自动回退插件 / SMTC
+const NCM_DEBUG_PORT = Number(process.env.ICU_NCM_PORT) || 9222;
+const NCM_PAGE_PATH = '/orpheus/pub/app.html';
+let cdpInjectedAt = 0, cdpErr = '', cdpBusy = false, cdpLastTry = 0, cdpLogOnce = false;
+let cdpLastPushAt = 0, ncmAutoAt = 0;
+
+function httpGetJson(url, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const rq = http.get(url, res => {
+      let d = '';
+      res.setEncoding('utf8');
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(new Error('返回格式异常')); } });
+    });
+    rq.setTimeout(timeoutMs || 1500, () => { try { rq.destroy(); } catch (e) {} reject(new Error('连接超时')); });
+    rq.on('error', reject);
+  });
+}
+function cdpTargets() {
+  return httpGetJson('http://127.0.0.1:' + NCM_DEBUG_PORT + '/json', 1500);
+}
+// 在网易云渲染进程里执行一段表达式并拿到结果
+function cdpEval(wsUrl, expression, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let ws;
+    try { ws = new WebSocket(wsUrl); } catch (e) { return reject(e); }
+    let done = false;
+    const timer = setTimeout(() => { if (!done) { done = true; try { ws.close(); } catch (e) {} reject(new Error('CDP 超时')); } }, timeoutMs || 6000);
+    ws.onerror = () => { if (!done) { done = true; clearTimeout(timer); reject(new Error('CDP 连接失败')); } };
+    ws.onopen = () => {
+      try {
+        ws.send(JSON.stringify({ id: 1, method: 'Runtime.enable' }));
+        ws.send(JSON.stringify({ id: 2, method: 'Runtime.evaluate', params: { expression, returnByValue: true } }));
+      } catch (e) {}
+    };
+    ws.onmessage = ev => {
+      try {
+        const m = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString());
+        if (m.id === 2 && !done) {
+          done = true; clearTimeout(timer); try { ws.close(); } catch (e) {}
+          if (m.result && m.result.exceptionDetails) return reject(new Error('注入异常: ' + (m.result.exceptionDetails.text || '')));
+          resolve(m.result && m.result.result);
+        }
+      } catch (e) {}
+    };
+  });
+}
+// 注入的就是内嵌插件源码, 只是多打一个 src:'cdp' 标记, 服务端据此优先采用
+function bridgeSrcForCdp() {
+  return Buffer.from(BRIDGE_JS_B64, 'base64').toString('utf8')
+    .replace(/__icuBridgeLoaded/g, '__icuBridgeCdp')
+    .replace(
+      "status: S.playing ? 'Playing' : 'Paused',",
+      "status: S.playing ? 'Playing' : 'Paused', src: 'cdp',"
+    );
+}
+async function ensureCdp() {
+  if (cdpBusy || Date.now() - cdpLastTry < 3000) return;
+  cdpBusy = true; cdpLastTry = Date.now();
+  try {
+    const list = await cdpTargets();
+    const t = (list || []).filter(x => x.type === 'page' && String(x.url).indexOf(NCM_PAGE_PATH) >= 0)[0];
+    if (!t) throw new Error('没找到网易云页面 (调试端口未开启?)');
+    await cdpEval(t.webSocketDebuggerUrl, bridgeSrcForCdp(), 6000);
+    cdpInjectedAt = Date.now(); cdpErr = '';
+    if (!cdpLogOnce) { cdpLogOnce = true; console.log('[cdp] 已注入网易云渲染进程, 直连播放进度'); }
+  } catch (e) { cdpErr = e.message; }
+  cdpBusy = false;
+}
+function cdpFresh() { return Date.now() - cdpLastPushAt < 5000; }
+
+// ---------- 网易云进程管理(找路径 / 是否运行 / 带参数重启) ----------
+const NCM_REG_PS = "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\cloudmusic.exe' -ErrorAction SilentlyContinue).'(default)'";
+function psRun(cmd, timeoutMs, extraEnv) {
+  return new Promise(resolve => {
+    const pre = '$OutputEncoding = [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; ';
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', pre + cmd],
+      { timeout: timeoutMs || 20000, windowsHide: true, env: Object.assign({}, process.env, extraEnv || {}) },
+      (err, stdout, stderr) => {
+        resolve({ err: err ? err.message : '', out: String(stdout || '').trim(), errOut: String(stderr || '').trim() });
+      });
+  });
+}
+async function ncmExePath() {
+  const cmds = [
+    "if ($p = Get-Process cloudmusic -ErrorAction SilentlyContinue | Select-Object -First 1) { $p.Path }",
+    NCM_REG_PS,
+  ];
+  for (const c of cmds) {
+    const r = await psRun(c, 8000);
+    const p = (r.out.split(/\r?\n/)[0] || '').trim();
+    if (p && fs.existsSync(p)) return p;
+  }
+  return '';
+}
+async function ncmRunning() {
+  const r = await psRun("if (Get-Process cloudmusic -ErrorAction SilentlyContinue) { 'ON' } else { 'OFF' }", 8000);
+  return r.out.indexOf('ON') >= 0;
+}
+// 杀掉没带参数的网易云, 再用 WMI 创建一个脱离本进程的带参数实例(否则本命令一结束它就被回收)
+async function ncmRelaunch() {
+  const exe0 = await ncmExePath();
+  if (!exe0) throw new Error('找不到网易云安装路径 (注册表里没有 App Paths)');
+  const stop = await psRun("try { Stop-Process -Name cloudmusic -Force -ErrorAction Stop; 'OK' } catch { 'ERR:' + $_.Exception.Message }", 15000);
+  if (stop.out.indexOf('OK') < 0) throw new Error('无法结束网易云: ' + (stop.out || stop.errOut || '权限不足'));
+  await new Promise(r => setTimeout(r, 2500));
+  const argLine = '"' + exe0 + '" --remote-debugging-port=' + NCM_DEBUG_PORT;
+  const cmd = 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $env:ICU_NCM_CMD } | Select-Object -ExpandProperty ReturnValue';
+  const r = await psRun(cmd, 15000, { ICU_NCM_CMD: argLine });
+  if (r.out.indexOf('0') !== 0 && r.out !== '0') throw new Error('启动失败: ' + (r.out || r.errOut || r.err));
+  let list = null;
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r2 => setTimeout(r2, 1000));
+    try { list = await cdpTargets(); if (list && list.length) break; } catch (e) {}
+  }
+  if (!list || !list.length) throw new Error('已启动, 但调试端口没起来(客户端可能忽略该参数)');
+  await ensureCdp();
+  return { exe: exe0, port: NCM_DEBUG_PORT };
+}
+// 每 6 秒: 端口在就注入; 都没有且没插件推送时, 自动带参数重启一次(60 秒内不重复)
+async function ncmWatchdog() {
+  if (cdpFresh()) return;
+  await ensureCdp();
+  if (pushFresh() || cdpFresh() || Date.now() - ncmAutoAt < 60000) return;
+  if (!(await ncmRunning())) return;
+  ncmAutoAt = Date.now();
+  console.log('[cdp] 网易云没带调试参数, 自动重启以启用直连…');
+  try { await ncmRelaunch(); console.log('[cdp] 直连已启用'); }
+  catch (e) { console.log('[cdp] 自动重启失败: ' + e.message); }
+}
+
+
+let CRC_TABLE = null;
+function crc32(buf) {
+  if (!CRC_TABLE) {
+    CRC_TABLE = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      CRC_TABLE[n] = c;
+    }
+  }
+  let crc = -1;
+  for (let i = 0; i < buf.length; i++) crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ buf[i]) & 0xFF];
+  return (crc ^ -1) >>> 0;
+}
+// 最小 ZIP 写入(仅存储不压缩): .plugin 就是含 manifest.json + main.js 的 zip
+function bridgeZip() {
+  const files = [
+    { name: 'manifest.json', data: Buffer.from(BRIDGE_MANIFEST, 'utf8') },
+    { name: 'main.js', data: Buffer.from(BRIDGE_JS_B64, 'base64') },
+  ];
+  const parts = [], central = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = Buffer.from(f.name, 'utf8');
+    const data = f.data;
+    const crc = crc32(data);
+    const h = Buffer.alloc(30);
+    h.writeUInt32LE(0x04034b50, 0); h.writeUInt16LE(20, 4); h.writeUInt16LE(0, 6);
+    h.writeUInt16LE(0, 8); h.writeUInt16LE(0, 10); h.writeUInt16LE(0, 12);
+    h.writeUInt32LE(crc, 14); h.writeUInt32LE(data.length, 18); h.writeUInt32LE(data.length, 22);
+    h.writeUInt16LE(name.length, 26); h.writeUInt16LE(0, 28);
+    parts.push(h, name, data);
+    const c = Buffer.alloc(46);
+    c.writeUInt32LE(0x02014b50, 0); c.writeUInt16LE(20, 4); c.writeUInt16LE(20, 6);
+    c.writeUInt16LE(0, 8); c.writeUInt16LE(0, 10); c.writeUInt16LE(0, 12); c.writeUInt16LE(0, 14);
+    c.writeUInt32LE(crc, 16); c.writeUInt32LE(data.length, 20); c.writeUInt32LE(data.length, 24);
+    c.writeUInt16LE(name.length, 28); c.writeUInt16LE(0, 30); c.writeUInt16LE(0, 32);
+    c.writeUInt16LE(0, 34); c.writeUInt16LE(0, 36); c.writeUInt32LE(0, 38); c.writeUInt32LE(offset, 42);
+    central.push(c, name);
+    offset += 30 + name.length + data.length;
+  }
+  const cd = Buffer.concat(central);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); eocd.writeUInt16LE(0, 4); eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(files.length, 8); eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(cd.length, 12); eocd.writeUInt32LE(offset, 16); eocd.writeUInt16LE(0, 20);
+  return Buffer.concat([Buffer.concat(parts), cd, eocd]);
+}
+function bridgePluginInstalled() {
+  try { return fs.existsSync(BRIDGE_PLUGIN_PATH); } catch (e) { return false; }
+}
+function installBridgePlugin() {
+  if (!fs.existsSync(BRIDGE_PLUGIN_DIR)) {
+    throw new Error('没找到 ' + BRIDGE_PLUGIN_DIR + '，请先安装 BetterNCM');
+  }
+  fs.writeFileSync(BRIDGE_PLUGIN_PATH, bridgeZip());
+  return BRIDGE_PLUGIN_PATH;
+}
+
 const LYRIC_CACHE = new Map();
+
+// ---------- 歌词索引: 歌名|歌手 → 选定的网易云版本(按时长匹配) + 手动偏移 ----------
+// 零依赖: 就是一个 JSON 文件, 比"每次重新猜版本"稳定得多
+const LYRIDX_PATH = path.join(DIR, 'lyrics.json');
+let lyridx = null, lyridxSaveTimer = null;
+function lyridxLoad() {
+  if (lyridx) return lyridx;
+  try {
+    const j = JSON.parse(fs.readFileSync(LYRIDX_PATH, 'utf8').replace(/^\uFEFF/, ''));
+    lyridx = j && j.items ? j : { version: 1, items: {} };
+  } catch (e) {
+    lyridx = { version: 1, items: {} };
+  }
+  return lyridx;
+}
+function lyricKey(title, artist) { return normTitle(title) + '|' + normTitle(artist); }
+function lyrIdxGet(title, artist) {
+  const it = lyridxLoad().items;
+  return it[lyricKey(title, artist)] || null;
+}
+function lyrIdxSaveSoon() {
+  if (lyridxSaveTimer) return;
+  lyridxSaveTimer = setTimeout(() => {
+    lyridxSaveTimer = null;
+    try {
+      const it = lyridxLoad().items;
+      const keys = Object.keys(it);
+      if (keys.length > 500) {
+        // 超上限时淘汰最久没动过的记录
+        keys.sort((a, b) => (it[a].updatedAt || 0) - (it[b].updatedAt || 0));
+        for (const k of keys.slice(0, keys.length - 500)) delete it[k];
+      }
+      fs.writeFileSync(LYRIDX_PATH, JSON.stringify(lyridx, null, 2), 'utf8');
+    } catch (e) {}
+  }, 400);
+}
+function lyrIdxPut(title, artist, patch) {
+  if (!title) return null;
+  const it = lyridxLoad().items;
+  const k = lyricKey(title, artist);
+  const rec = it[k] || { name: title, artist: artist || '', offset: 0 };
+  Object.assign(rec, patch, { updatedAt: Date.now() });
+  it[k] = rec;
+  lyrIdxSaveSoon();
+  return rec;
+}
+function lyrIdxDrop(title, artist) {
+  const it = lyridxLoad().items;
+  const k = lyricKey(title, artist);
+  if (it[k]) { delete it[k]; lyrIdxSaveSoon(); }
+}
+function lyrIdxOffset(title, artist) {
+  const r = lyrIdxGet(title, artist);
+  return r && typeof r.offset === 'number' ? r.offset : 0;
+}
+async function lyricBySongId(id) {
+  const j = await ncmReq('/api/song/lyric', { id, lv: -1, tv: -1, kv: -1 });
+  return { lrc: ((j || {}).lrc || {}).lyric || '', tlrc: ((j || {}).tlyric || {}).lyric || '' };
+}
+// 已知真实音频时长时, 优先选时长最接近的候选(同名不同版本是歌词错位的根源)
+function pickCands(cands, durSec) {
+  if (!(durSec > 0)) return cands;
+  return cands.slice().sort((a, b) => {
+    const da = Math.abs((a.song.dt || 0) / 1000 - durSec);
+    const db = Math.abs((b.song.dt || 0) / 1000 - durSec);
+    if (Math.abs(da - db) > 0.5) return da - db;
+    return b.sc - a.sc;
+  });
+}
+// 导入时预先关联歌词版本: 此刻能拿到 B 站音频的精确时长
+async function indexLyricForSong(title, artist, durSec, send) {
+  try {
+    const old = lyrIdxGet(title, artist);
+    if (old && old.manual) { if (send) send('[歌词] 已保留手动校准的版本'); return; }
+    const cands = pickCands(await ncmSongCands(title, artist), durSec);
+    if (!cands.length) { if (send) send('[歌词] 没找到可匹配的版本, 播放时会再试'); return; }
+    for (const c of cands.slice(0, 6)) {
+      const r = await lyricBySongId(c.song.id);
+      if (lrcLines(r.lrc).length < 5 || isJunkLyric(r.lrc)) continue;
+      lyrIdxPut(title, artist, {
+        songId: String(c.song.id), name: c.song.name || title, artist: c.artist,
+        durMs: c.song.dt || 0, audioDurMs: Math.round((durSec || 0) * 1000),
+        lrc: r.lrc, tlrc: r.tlrc,
+      });
+      if (send) send('[歌词] 已关联「' + (c.song.name || title) + '」 ' + Math.round((c.song.dt || 0) / 1000) + 's (本段 ' + Math.round(durSec || 0) + 's)');
+      return;
+    }
+    if (send) send('[歌词] 找到的版本没有可用歌词');
+  } catch (e) {
+    if (send) send('[歌词] 关联失败: ' + e.message);
+  }
+}
+
 function normTitle(s) {
   return String(s || '').toLowerCase().replace(/[\s\-_·・.。,，!？!?'"“”‘’()（）\[\]【】]/g, '');
 }
@@ -1300,32 +1629,70 @@ async function findNcmSong(title, artist) {
   const c = await ncmSongCands(title, artist);
   return c.length ? c[0].song : null;
 }
-async function lyricFor(title, artist) {
+async function lyricFor(title, artist, durSec) {
   const key = title + '|' + artist;
   if (LYRIC_CACHE.has(key)) return LYRIC_CACHE.get(key);
-  let out;
+  let out = null;
   try {
-    const cands = await ncmSongCands(title, artist);
-    if (!cands.length) {
-      out = { ok: false, error: '没找到这首歌' };
-    } else {
-      // 逐个候选尝试: 有些版本只有“作词/作曲”一两行占位, 不能当歌词用
-      let first = null;
-      for (const c of cands.slice(0, 3)) {
-        const song = c.song;
-        const j = await ncmReq('/api/song/lyric', { id: song.id, lv: -1, tv: -1, kv: -1 });
-        const lrc = ((j || {}).lrc || {}).lyric || '';
-        const tlrc = ((j || {}).tlyric || {}).lyric || '';
-        if (!lrc) continue;
-        const cand = {
-          ok: true, songId: String(song.id), name: song.name || title,
-          artist: (song.ar || song.artists || []).map(a => a.name).filter(Boolean).join('/'),
-          durMs: song.dt || 0, lrc, tlrc, lines: lrcLines(lrc).length,
+    const idx = lyrIdxGet(title, artist);
+    // 1) 本地已保存歌词: 直接用, 不再联网(网络那份可能是别的版本/会下架/会变)
+    if (idx && idx.lrc) {
+      const n = lrcLines(idx.lrc).length;
+      if (n >= 2 && !isJunkLyric(idx.lrc)) {
+        out = {
+          ok: true, songId: String(idx.songId || ''), name: idx.name || title,
+          artist: idx.artist || artist, durMs: idx.durMs || 0,
+          lrc: idx.lrc, tlrc: idx.tlrc || '', lines: n, fromIndex: true, local: true,
         };
-        if (!first) first = cand;
-        if (cand.lines >= 5) { first = cand; break; }
+      } else {
+        lyrIdxDrop(title, artist);
       }
-      out = first || { ok: false, error: '这首歌没有歌词' };
+    }
+    // 2) 只有 songId 的老记录: 按 id 取一次, 并把歌词全文回存
+    if (!out && idx && idx.songId) {
+      const r = await lyricBySongId(idx.songId);
+      const n = lrcLines(r.lrc).length;
+      if (n >= 2 && !isJunkLyric(r.lrc)) {
+        lyrIdxPut(title, artist, { lrc: r.lrc, tlrc: r.tlrc });
+        out = {
+          ok: true, songId: String(idx.songId), name: idx.name || title,
+          artist: idx.artist || artist, durMs: idx.durMs || 0,
+          lrc: r.lrc, tlrc: r.tlrc, lines: n, fromIndex: true,
+        };
+      } else {
+        lyrIdxDrop(title, artist); // 版本已失效(下架/无版权)
+      }
+    }
+    // 3) 完全没有: 搜索候选(按时长优先), 选中后把歌词全文存进索引
+    if (!out) {
+      const cands = pickCands(await ncmSongCands(title, artist), durSec);
+      if (!cands.length) {
+        out = { ok: false, error: '没找到这首歌' };
+      } else {
+        let first = null;
+        for (const c of cands.slice(0, 6)) {
+          const song = c.song;
+          const j = await ncmReq('/api/song/lyric', { id: song.id, lv: -1, tv: -1, kv: -1 });
+          const lrc = ((j || {}).lrc || {}).lyric || '';
+          const tlrc = ((j || {}).tlyric || {}).lyric || '';
+          if (!lrc || isJunkLyric(lrc)) continue;
+          const cand = {
+            ok: true, songId: String(song.id), name: song.name || title,
+            artist: (song.ar || song.artists || []).map(a => a.name).filter(Boolean).join('/'),
+            durMs: song.dt || 0, lrc, tlrc, lines: lrcLines(lrc).length,
+          };
+          if (!first) first = cand;
+          if (cand.lines >= 5) { first = cand; break; }
+        }
+        out = first || { ok: false, error: '网易云只有纯音乐/伴奏版本, 没有可用歌词' };
+        if (out.ok) {
+          lyrIdxPut(title, artist, {
+            songId: out.songId, name: out.name, artist: out.artist,
+            durMs: out.durMs, audioDurMs: durSec > 0 ? Math.round(durSec * 1000) : 0,
+            offset: lyrIdxOffset(title, artist), lrc: out.lrc, tlrc: out.tlrc,
+          });
+        }
+      }
     }
   } catch (e) {
     out = { ok: false, error: e.message };
@@ -1350,12 +1717,37 @@ function lrcLines(txt) {
   }
   return out.sort((a, b) => a.t - b.t);
 }
+// 纯音乐/占位歌词不算歌词(网易云常把伴奏/翻唱上传成同名歌曲, 歌词只有一句"纯音乐，请欣赏")
+function isJunkLyric(txt) {
+  const lines = lrcLines(txt);
+  if (lines.length < 3) return true;
+  const real = lines.filter(x => !/纯音乐|请欣赏|暂无歌词|无歌词|没有歌词|該歌曲|该歌曲|instrumental|演奏版|伴奏/i.test(x.text));
+  return real.length < 3;
+}
 
-let live = { key: '', title: '', artist: '', lines: [], dur: 0, anchor: 0, at: 0, paused: false, loading: false, error: '' };
+// 读网易云窗口播放条时间(OCR), 用于把歌词对齐到真实进度
+async function ocrPlayPos() {
+  const p = path.join(os.tmpdir(), 'grayicu_pos.ps1');
+  fs.writeFileSync(p, '\uFEFF' + OCR_PS, 'utf8');
+  const out = await new Promise((resolve, reject) => {
+    execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', p],
+      { timeout: 8000, windowsHide: true, maxBuffer: 1048576 }, (err, stdout) => {
+        if (err && !String(stdout || '').trim()) return reject(new Error(err.killed ? '校准超时' : '校准失败'));
+        resolve(String(stdout || ''));
+      });
+  });
+  const line = out.split(/\r?\n/).map(x => x.trim()).filter(x => x.startsWith('{')).pop();
+  if (!line) throw new Error('没读到播放时间，请把网易云窗口露出来再试');
+  let j;
+  try { j = JSON.parse(line); } catch (e) { throw new Error('校准返回格式异常'); }
+  return j;
+}
 
-function liveLoad(key, title, artist) {
+let live = { key: '', title: '', artist: '', lines: [], dur: 0, anchor: 0, at: 0, paused: false, loading: false, error: '', off: 0, rechecked: false };
+
+function liveLoad(key, title, artist, durSec) {
   live.loading = true;
-  lyricFor(title, artist).then(j => {
+  lyricFor(title, artist, durSec).then(j => {
     if (live.key !== key) return;
     if (j && j.ok) {
       const ls = lrcLines(j.lrc).filter(l => {
@@ -1375,33 +1767,84 @@ function liveLoad(key, title, artist) {
   }).catch(() => { if (live.key === key) live.loading = false; });
 }
 
+function autoCalibrate(key, src) {
+  setTimeout(() => {
+    if (live.key !== key) return;
+    ocrPlayPos().then(j => {
+      if (live.key !== key) return;
+      if (j && j.ok && typeof j.pos === 'number') liveSeek(j.pos);
+    }).catch(() => {});
+  }, src === 'smtc' ? 2500 : 1500);
+}
+
+// 有真实播放进度时(InfLink-rs 上报 SMTC timeline), 歌词直接跟随真实位置, 不再靠计时推算
+function smHasPos() {
+  if (pushFresh() && typeof pushState.pos === 'number' && pushState.pos >= 0) return true;
+  return smState.src === 'smtc' && typeof smState.pos === 'number' && smState.pos >= 0;
+}
+function smLivePos(now) {
+  if (pushFresh()) return pushLivePos(now);
+  const base = Number(smState.pos) || 0;
+  if (smState.status === 'Paused') return base;
+  return base + Math.max(0, now - (Number(smState.posAt) || now));
+}
+
 function liveTickState() {
   ensureSmWatcher();
   const now = Date.now() / 1000;
-  const title = smState.title || '', artist = smState.artist || '';
-  const pausedNow = smState.status === 'Paused';
+  const pushed = pushFresh();
+  const srcState = pushed ? pushState : smState;
+  const title = srcState.title || '', artist = srcState.artist || '';
+  const pausedNow = srcState.status === 'Paused';
   if (!title) {
-    live = { key: '', title: '', artist: '', lines: [], dur: 0, anchor: 0, at: now, paused: false, loading: false, error: '' };
+    live = { key: '', title: '', artist: '', lines: [], dur: 0, anchor: 0, at: now, paused: false, loading: false, error: '', off: 0, warn: '' };
     return { ok: true, title: '', playing: false, paused: false, pos: 0, dur: 0, lines: [] };
   }
   const key = title + '|' + artist;
   if (key !== live.key) {
-    live = { key, title, artist, lines: [], dur: 0, anchor: 0, at: now, paused: pausedNow, loading: false, error: '' };
-    liveLoad(key, title, artist);
+    // 换歌: 偏移直接取索引里记住的值, 不再每次清零重调
+    live = { key, title, artist, lines: [], dur: 0, anchor: 0, at: now, paused: pausedNow, loading: false, error: '', off: lyrIdxOffset(title, artist), rechecked: false, warn: '' };
+    liveLoad(key, title, artist, pushed ? pushState.dur : 0);
+    // 换歌自动校准一次: 从 0 开始的计时无法知道前奏/拖进度, 用 OCR 读播放条对齐
+    if (!smHasPos()) autoCalibrate(key, smState.src);
+  }
+  // 用插件上报的真实音频时长复核歌词版本: 偏差超过 3 秒说明不是同一个版本, 换一份重试一次
+  // (同一版本一般 <2 秒; 以前按 10% 算, 长歌要到 30 秒才触发, 太松)
+  if (pushed && pushState.dur > 0 && live.lines.length && live.dur > 0 && !live.rechecked
+    && Math.abs(live.dur - pushState.dur) > 3 && !(lyrIdxGet(title, artist) || {}).manual) {
+    live.rechecked = true;
+    lyrIdxDrop(title, artist);
+    LYRIC_CACHE.delete(key);
+    liveLoad(key, title, artist, pushState.dur);
+  }
+  // 换完还是差得多(live/翻唱版): 明确告诉用户, 不要装作同步
+  live.warn = '';
+  if (live.lines.length && live.dur > 0 && pushed && pushState.dur > 0) {
+    const dDiff = Math.abs(live.dur - pushState.dur);
+    if (dDiff > 3 && !(lyrIdxGet(title, artist) || {}).manual) {
+      live.warn = '没找到同版本歌词(歌词 ' + Math.round(live.dur) + 's / 音源 ' + Math.round(pushState.dur) + 's, 差 ' + Math.round(dDiff) + 's), 可手动微调';
+    }
   }
   if (pausedNow && !live.paused) { live.anchor = live.anchor + (now - live.at); live.paused = true; }
   if (!pausedNow && live.paused) { live.paused = false; live.at = now; }
-  const pos = Math.max(0, live.paused ? live.anchor : live.anchor + (now - live.at));
+  const anchorPos = Math.max(0, live.paused ? live.anchor : live.anchor + (now - live.at));
+  const pos = Math.max(0, (smHasPos() ? smLivePos(now) : anchorPos) + (live.off || 0));
   return {
     ok: true, title: live.title, artist: live.artist,
     playing: !live.paused, paused: live.paused,
-    pos: Math.round(pos * 10) / 10, dur: live.dur,
-    lines: live.lines, error: live.lines.length ? '' : live.error,
+    pos: Math.round(pos * 10) / 10, dur: live.dur || (pushed && pushState.dur > 0 ? pushState.dur : 0),
+    audioDur: pushed && pushState.dur > 0 ? pushState.dur : 0,
+    lines: live.lines, error: live.lines.length ? '' : live.error, warn: live.warn || '',
   };
 }
 
 function liveNudge(sec) {
   const now = Date.now() / 1000;
+  if (smHasPos()) {
+    live.off = (live.off || 0) + sec;
+    lyrIdxPut(live.title, live.artist, { offset: live.off }); // 记住手动偏移
+    return;
+  }
   const cur = live.paused ? live.anchor : live.anchor + (now - live.at);
   live.anchor = Math.max(0, cur + sec);
   live.at = now;
@@ -1409,13 +1852,19 @@ function liveNudge(sec) {
 
 // 直接对齐到某个时间点(服务重启/中途开启歌词窗时用)
 function liveSeek(sec) {
+  const now = Date.now() / 1000;
+  if (smHasPos()) {
+    live.off = (Number(sec) || 0) - smLivePos(now);
+    lyrIdxPut(live.title, live.artist, { offset: live.off }); // 记住对齐结果
+    return;
+  }
   live.anchor = Math.max(0, Number(sec) || 0);
-  live.at = Date.now() / 1000;
+  live.at = now;
 }
 
 // ---------- 桌面歌词独立窗口 (Electron): 由服务端按需拉起 ----------
 const DESKTOP_DIR = path.join(DIR, 'desktop');
-let lyricProc = null;
+let lyricProc = null, lyricInstalling = false;
 function lyricWindowRunning() { return !!lyricProc; }
 function electronBinPath() {
   try {
@@ -1423,10 +1872,7 @@ function electronBinPath() {
     return typeof p === 'string' ? p : null;
   } catch (e) { return null; }
 }
-function openLyricWindow() {
-  if (lyricProc) return { ok: true, running: true };
-  const bin = electronBinPath();
-  if (!bin) return { ok: false, error: '桌面歌词组件还没安装，请在 desktop 目录执行 npm install' };
+function startLyricProc(bin) {
   try {
     lyricProc = spawn(bin, ['.'], { cwd: DESKTOP_DIR, stdio: 'ignore' });
     lyricProc.on('exit', () => { lyricProc = null; });
@@ -1436,6 +1882,39 @@ function openLyricWindow() {
     return { ok: false, error: e.message };
   }
   return { ok: true, running: true };
+}
+// 按需自动安装桌面歌词组件(换新电脑/新克隆时 desktop/node_modules 不存在)
+function installElectron() {
+  return new Promise(resolve => {
+    let done = false;
+    const finish = ok => {
+      if (done) return;
+      done = true; lyricInstalling = false; resolve(ok);
+    };
+    try {
+      const p = spawn('npm install --no-audit --no-fund', {
+        cwd: DESKTOP_DIR, stdio: 'ignore', shell: true,
+        env: { ...process.env, ELECTRON_MIRROR: process.env.ELECTRON_MIRROR || 'https://npmmirror.com/mirrors/electron/' },
+      });
+      p.on('exit', code => finish(code === 0));
+      p.on('error', () => finish(false));
+      setTimeout(() => finish(false), 300000);
+    } catch (e) { finish(false); }
+  });
+}
+function openLyricWindow() {
+  if (lyricProc) return { ok: true, running: true };
+  const bin = electronBinPath();
+  if (!bin) {
+    if (lyricInstalling) return { ok: true, installing: true };
+    lyricInstalling = true;
+    installElectron().then(ok => {
+      const b = ok ? electronBinPath() : null;
+      if (b && !lyricProc) startLyricProc(b);
+    });
+    return { ok: true, installing: true };
+  }
+  return startLyricProc(bin);
 }
 function closeLyricWindow() {
   if (lyricProc) { try { lyricProc.kill(); } catch (e) {} lyricProc = null; }
@@ -1931,11 +2410,15 @@ const PAGE = `<!DOCTYPE html>
     <div class="lyr-time"><span id="lyrNow">00:00</span><span id="lyrDur">00:00</span></div>
     <input type="range" class="lyr-seek" id="lyrSeek" min="0" max="100" step="0.5" value="0"
            oninput="seekLyric(this.value)" aria-label="校准进度">
+    <div id="lyrCands" style="display:none;margin:8px 0 0;max-height:230px;overflow:auto;border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:6px 8px;font-size:12px;line-height:1.6"></div>
     <div class="listen-acts">
       <button class="mini" onclick="nudgeLyric(-1)">−1 秒</button>
       <button class="mini" onclick="nudgeLyric(1)">+1 秒</button>
       <button class="mini" onclick="calibrateLyric(this)">校准</button>
       <button class="mini" onclick="recalibrate()">从头对齐</button>
+      <button class="mini" onclick="openCands()">换歌词版本</button>
+      <button class="mini" onclick="ncmDirect(this)" title="不用插件: 以调试端口重启网易云后直接读进度">调试直连</button>
+      <button class="mini" id="brBtn" onclick="installBridge(this)" title="安装网易云桥接插件, 拿到真实进度">桥接插件</button>
       <button class="mini" onclick="closeLyric()">关闭</button>
     </div>
   </div>
@@ -2360,7 +2843,7 @@ function closeSrc() {
 
 // ---------- 实时歌词: 锚点+计时推算(网易云不上报进度, 只能自算) ----------
 let lyrTimer = null, lyrBusy = false, lyrIdx = -1, lyrWarned = false;
-let lyrKey = '', lyrLines = [], lyrDur = 0, lyrStatus = '', lyrSong = { title: '', artist: '' };
+let lyrKey = '', lyrLines = [], lyrDur = 0, lyrStatus = '', lyrSong = { title: '', artist: '' }, lyrAudioDur = 0;
 let lyrAnc = { pos: 0, at: 0, paused: false };
 let lyrWinPoll = null;
 
@@ -2375,6 +2858,7 @@ async function toggleLyric(){
     }
     const r = await (await fetch('/api/lyric-window', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'open' }) })).json();
     if (!r.ok) { toast(r.error || '桌面歌词启动失败'); openLyric(); return; }
+    if (r.installing) { setLyrBtn(true); startLyrWinPoll(); toast('首次使用，正在安装桌面歌词组件（约 20 秒），装好会自动打开'); return; }
     setLyrBtn(true); startLyrWinPoll(); toast('桌面歌词已开启，可拖动浮窗到任意位置');
   } catch (e) {
     toast('桌面歌词启动失败'); openLyric();
@@ -2389,7 +2873,9 @@ function startLyrWinPoll(){
   lyrWinPoll = setInterval(async () => {
     try {
       const st = await (await fetch('/api/lyric-window')).json();
-      if (!st.running) { setLyrBtn(false); stopLyrWinPoll(); }
+      if (st.running) { setLyrBtn(true); stopLyrWinPoll(); return; }
+      if (st.installing) return; // 组件安装中, 继续等待
+      setLyrBtn(false); stopLyrWinPoll();
     } catch (e) {}
   }, 3000);
 }
@@ -2400,6 +2886,7 @@ function openLyric(){
   lockScroll(); startLyricLoop();
 }
 function closeLyric(){
+  closeCands();
   stopLyricLoop();
   $('lyricModal').hidden = true;
   $('lyrBtn').classList.remove('on'); $('lyrBtn').setAttribute('aria-pressed', 'false');
@@ -2413,6 +2900,71 @@ function startLyricLoop(){
   lyrTimer = setInterval(lyricTick, 500);
 }
 function stopLyricLoop(){ if (lyrTimer) { clearInterval(lyrTimer); lyrTimer = null; } }
+let lyrCandsData = [];
+function closeCands(){ const b = $('lyrCands'); if (b) { b.style.display = 'none'; b.innerHTML = ''; } }
+async function openCands(){
+  const t = lyrSong.title, a = lyrSong.artist;
+  if (!t) return;
+  const b = $('lyrCands');
+  b.style.display = 'block';
+  b.innerHTML = '正在搜索可用的歌词版本…';
+  try {
+    const r = await (await fetch('/api/lyric/cands?title=' + encodeURIComponent(t) + '&artist=' + encodeURIComponent(a) + '&dur=' + Math.round(lyrAudioDur || 0))).json();
+    if (!r.ok) { b.innerHTML = esc(r.error || '搜索失败'); return; }
+    lyrCandsData = r.cands || [];
+    const head = '音源 ' + Math.round(r.dur || 0) + 's' + (r.current && r.current.saved ? ' · 当前: ' + esc(r.current.name) + ' ' + Math.round((r.current.durMs || 0) / 1000) + 's' : '');
+    b.innerHTML = '<div style="opacity:.7;margin-bottom:4px">' + head + '</div>' +
+      (lyrCandsData.length ? lyrCandsData.map((c, i) =>
+        '<div onclick="pickCand(' + i + ')" style="cursor:pointer;padding:3px 4px;border-bottom:1px solid rgba(255,255,255,.06)' +
+        (c.current ? ';opacity:.55' : '') + '">' + esc(c.name) + ' · ' + esc(c.artist) + ' · ' + Math.round((c.durMs || 0) / 1000) + 's' +
+        (c.diff != null ? ' <span style="opacity:.6">(差 ' + c.diff + 's)</span>' : '') +
+        (c.current ? ' 当前' : '') + '</div>').join('')
+        : '没搜到候选版本');
+  } catch (e) { b.innerHTML = '搜索失败'; }
+}
+async function pickCand(i){
+  const c = lyrCandsData[i];
+  if (!c) return;
+  const b = $('lyrCands');
+  b.innerHTML = '正在读取这个版本的歌词…';
+  try {
+    const r = await (await fetch('/api/lyric/pick', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: lyrSong.title, artist: lyrSong.artist, songId: c.songId, name: c.name, artistName: c.artist, durMs: c.durMs }),
+    })).json();
+    if (!r.ok) { b.innerHTML = esc(r.error || '这个版本没有可用歌词'); return; }
+    closeCands();
+    await loadLyric(lyrSong.title, lyrSong.artist, lyrAudioDur);
+  } catch (e) { b.innerHTML = '保存失败'; }
+}
+async function ncmDirect(btn){
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '重启中…';
+  try {
+    const j = await (await fetch('/api/ncm/relaunch', { method: 'POST' })).json();
+    if (!j.ok) alert(j.error || '直连失败');
+  } catch (e) { alert('直连失败'); }
+  btn.disabled = false; btn.textContent = old;
+}
+async function installBridge(btn){
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = '安装中…';
+  try {
+    const j = await (await fetch('/api/plugin/install', { method: 'POST' })).json();
+    if (j.ok) {
+      btn.textContent = '已安装·重启网易云';
+      setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 3000);
+    } else {
+      btn.textContent = '安装失败'; btn.disabled = false;
+      alert(j.error || '安装失败');
+      setTimeout(() => { btn.textContent = old; }, 3000);
+    }
+  } catch (e) {
+    btn.textContent = '安装失败'; btn.disabled = false;
+    setTimeout(() => { btn.textContent = old; }, 3000);
+  }
+}
+let lyrSrvPos = 0, lyrOff = 0;
 function lyrPos(){
   const t = performance.now() / 1000;
   return Math.max(0, lyrAnc.paused ? lyrAnc.pos : lyrAnc.pos + (t - lyrAnc.at));
@@ -2442,7 +2994,7 @@ async function lyricTick(){
   if (lyrBusy) return;
   lyrBusy = true;
   try {
-    const j = await (await fetch('/api/nowplaying')).json();
+    const j = await (await fetch('/api/live')).json();
     const title = j.title || '', artist = j.artist || '';
     if (!title) {
       $('lyrSub').textContent = '网易云没在放歌';
@@ -2459,22 +3011,20 @@ async function lyricTick(){
     if (key !== lyrKey) {
       lyrKey = key; lyrStatus = ''; lyrLines = []; lyrDur = 0; lyrIdx = -1; lyrWarned = false;
       lyrSong = { title, artist };
-      setAnchor(0); lyrAnc.paused = false;
+      lyrOff = 0; setAnchor(0); lyrAnc.paused = false;
       $('lyrTitle').textContent = title;
       $('lyrSub').textContent = (artist ? artist + ' · ' : '') + '正在找歌词…';
       $('lyrBox').innerHTML = '<div class="lyr-empty">正在找歌词…</div>';
-      await loadLyric(title, artist);
+      lyrAudioDur = Number(j.audioDur) || 0;
+      await loadLyric(title, artist, lyrAudioDur);
     }
-    if (j.status === 'Paused' && !lyrAnc.paused) {
-      lyrAnc.pos = lyrPos(); lyrAnc.paused = true;
-    } else if (j.status !== 'Paused' && lyrAnc.paused) {
-      lyrAnc.paused = false; lyrAnc.at = performance.now() / 1000;
-    }
-    if (j.status === 'Playing' && lyrStatus !== 'Playing') {
-      lyrAnc.at = performance.now() / 1000 - 0.4;
-    }
-    lyrStatus = j.status;
-    if (lyrDur > 0 && !lyrWarned && lyrPos() > lyrDur + 5) {
+    // 服务端已按网易云真实播放进度(SMTC timeline)算好 pos: 前端直接跟随, 不再自己计时
+    lyrSrvPos = Number(j.pos) || 0;
+    setAnchor(lyrSrvPos + lyrOff);
+    lyrAnc.paused = !!j.paused;
+    if (j.warn) {
+      $('lyrSub').textContent = (artist ? artist + ' · ' : '') + j.warn;
+    } else if (lyrDur > 0 && !lyrWarned && lyrPos() > lyrDur + 5) {
       lyrWarned = true;
       $('lyrSub').textContent = (artist ? artist + ' · ' : '') + '可能不同步，点歌词或拖进度条校准';
     }
@@ -2485,9 +3035,9 @@ async function lyricTick(){
     lyrBusy = false;
   }
 }
-async function loadLyric(title, artist){
+async function loadLyric(title, artist, audioDur){
   try {
-    const j = await (await fetch('/api/lyric?title=' + encodeURIComponent(title) + '&artist=' + encodeURIComponent(artist))).json();
+    const j = await (await fetch('/api/lyric?title=' + encodeURIComponent(title) + '&artist=' + encodeURIComponent(artist) + '&dur=' + Math.round(Number(audioDur) || 0))).json();
     if (lyrKey !== title + '|' + artist) return;
     if (!j.ok) {
       $('lyrSub').textContent = (artist ? artist + ' · ' : '') + (j.error || '没找到歌词');
@@ -2530,19 +3080,23 @@ function renderLyric(){
 }
 function anchorLine(i){
   if (!lyrLines[i]) return;
-  setAnchor(lyrLines[i].t);
+  lyrOff = lyrLines[i].t - lyrSrvPos;
+  setAnchor(lyrSrvPos + lyrOff);
   renderLyric();
 }
 function seekLyric(v){
-  setAnchor(Number(v) || 0);
+  lyrOff = (Number(v) || 0) - lyrSrvPos;
+  setAnchor(lyrSrvPos + lyrOff);
   renderLyric();
 }
 function nudgeLyric(d){
-  setAnchor(lyrPos() + d);
+  lyrOff += d;
+  setAnchor(lyrSrvPos + lyrOff);
   renderLyric();
 }
 function recalibrate(){
-  setAnchor(0);
+  lyrOff = 0;
+  setAnchor(lyrSrvPos);
   lyrWarned = false;
   renderLyric();
 }
@@ -3001,11 +3555,14 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
 <style>
   html,body{margin:0;padding:0;height:100%;background:transparent;overflow:hidden;user-select:none}
   body{--lc:#ffffff;font:14px/1.5 "PingFang SC","Microsoft YaHei",-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased;color:#fff}
-  .wrap{height:100%;display:flex;flex-direction:column;justify-content:center;padding:0 26px 4px;-webkit-app-region:drag}
-  .song{font-size:12.5px;color:rgba(255,255,255,.62);text-shadow:0 1px 4px rgba(0,0,0,.9);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:.3px}
-  .cur{margin-top:4px;line-height:1.28;color:var(--lc);word-break:break-word}
+  .wrap{height:calc(100% - 34px);margin-top:34px;display:flex;flex-direction:column;justify-content:center;padding:0 26px 4px;box-sizing:border-box;-webkit-app-region:no-drag}
+  .song{font-size:13px;font-weight:500;color:rgba(255,255,255,.6);text-shadow:0 1px 4px rgba(0,0,0,.9);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:.6px}
+  .song,.cur,.next{-webkit-app-region:no-drag}
+  .cur{margin-top:6px;line-height:1.32;letter-spacing:.2px;color:var(--lc);word-break:break-word;text-wrap:balance}
+  @keyframes lyricSwap{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+  .cur.swap{animation:lyricSwap .26s cubic-bezier(.22,.61,.36,1)}
   .cur.dim{font-size:16px!important;font-weight:400;color:rgba(255,255,255,.72);text-shadow:0 1px 6px rgba(0,0,0,.9)}
-  .next{margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:24px}
+  .next{margin-top:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:26px;transition:opacity .2s}
   body.s-classic .cur{font-size:calc(34px * var(--fs,1));font-weight:700;text-shadow:0 2px 10px rgba(0,0,0,.95),0 0 3px rgba(0,0,0,.95)}
   body.s-classic .next{font-size:calc(19px * var(--fs,1));color:rgba(255,255,255,.7);text-shadow:0 1px 8px rgba(0,0,0,.9)}
   body.s-neon .cur{font-size:calc(34px * var(--fs,1));font-weight:800;letter-spacing:.5px;text-shadow:0 0 6px var(--lc),0 0 22px var(--lc),0 2px 12px rgba(0,0,0,.9)}
@@ -3014,8 +3571,9 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
   body.s-minimal .next{display:none}
   body.s-custom .cur{font-size:calc(34px * var(--fs,1));font-weight:600;text-shadow:0 2px 14px rgba(0,0,0,.92)}
   body.s-custom .next{font-size:calc(19px * var(--fs,1));color:var(--lc);opacity:.6}
-  .bar{position:fixed;top:6px;right:10px;display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:6px;max-width:calc(100% - 20px);opacity:.45;transition:opacity .18s;-webkit-app-region:no-drag}
-  body:hover .bar{opacity:1}
+  .bar{position:fixed;top:6px;right:10px;z-index:99;display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:6px;max-width:calc(100% - 20px);opacity:0;visibility:hidden;pointer-events:none;transition:opacity .18s;-webkit-app-region:no-drag}
+  .bar.on{opacity:1;visibility:visible;pointer-events:auto}
+
   body.locked .bar{display:none}
   .bar button[hidden],.bar select[hidden]{display:none}
   .sw{display:inline-flex;align-items:center;gap:4px}
@@ -3028,7 +3586,7 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
   body.s-custom.o-soft .cur{text-shadow:0 2px 10px rgba(0,0,0,.9),0 0 2px rgba(0,0,0,.6)}
   body.s-custom.o-strong .cur{text-shadow:0 2px 10px rgba(0,0,0,.95),0 0 4px #000,0 0 2px #000}
   body.s-custom.hide-next .next{display:none}
-  .lockhint{position:fixed;top:8px;right:12px;font-size:11px;color:rgba(255,255,255,.78);background:rgba(20,20,24,.55);border:1px solid rgba(255,255,255,.16);border-radius:6px;padding:3px 8px;display:none;-webkit-app-region:no-drag}
+  .lockhint{position:fixed;top:8px;right:12px;z-index:98;font-size:11px;color:rgba(255,255,255,.78);background:rgba(20,20,24,.55);border:1px solid rgba(255,255,255,.16);border-radius:6px;padding:3px 8px;display:none;cursor:pointer;font-family:inherit;-webkit-app-region:no-drag}
   body.locked .lockhint{display:block}
   .bar button,.bar select,.bar input[type=color],.bar input[type=text]{background:rgba(20,20,24,.55);border:1px solid rgba(255,255,255,.18);color:rgba(255,255,255,.8);border-radius:6px;font-size:11px;font-family:inherit;outline:none;cursor:pointer;-webkit-app-region:no-drag}
   .bar button{padding:3px 9px}
@@ -3063,10 +3621,10 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
   <input id="seek" type="text" placeholder="mm:ss" hidden />
   <button id="fdown" type="button">A−</button>
   <button id="fup" type="button">A+</button>
-  <button id="lock" type="button" title="锁定后鼠标穿透，按 Ctrl+Alt+L 解锁">锁定</button>
+  <button id="lock" type="button" title="锁定后只保留解锁按钮，点击即可解锁">锁定</button>
   <button id="close" type="button">关闭</button>
 </div>
-<div class="lockhint" id="lockhint">已锁定 · Ctrl+Alt+L 解锁</div>
+<button class="lockhint" id="lockhint" type="button" title="点击解锁">已锁定 · 点击解锁</button>
 <div class="wrap">
   <div class="song" id="song">正在连接网易云…</div>
   <div class="cur dim" id="cur">等待播放…</div>
@@ -3111,7 +3669,7 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
     ['o-none','o-soft','o-strong'].forEach(function(cl){ document.body.classList.remove(cl); });
     document.body.classList.add('o-'+co);
     document.body.classList.toggle('hide-next', cn==='0');
-    document.documentElement.style.setProperty('--lc',lcolor);
+    document.body.style.setProperty('--lc',lcolor);
     styleSel.value=style; colorEl.value=lcolor;
     cwSel.value=cw; coSel.value=co; cnSel.value=cn;
     var showCustom=(style==='custom');
@@ -3122,7 +3680,7 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
     lcolor=c;
     try{ localStorage.setItem('grayicu.lyric.color',lcolor); }catch(e){}
     colorEl.value=lcolor;
-    document.documentElement.style.setProperty('--lc',lcolor);
+    document.body.style.setProperty('--lc',lcolor);
     markSw();
   }
   styleSel.onchange=function(){
@@ -3135,12 +3693,79 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
   coSel.onchange=function(){ co=coSel.value; try{ localStorage.setItem('grayicu.lyric.o',co); }catch(e){} applyTheme(); };
   cnSel.onchange=function(){ cn=cnSel.value; try{ localStorage.setItem('grayicu.lyric.n',cn); }catch(e){} applyTheme(); };
   applyTheme();
-  var lockBtn=document.getElementById('lock');
+  var lockBtn=document.getElementById('lock'), hintBtn=document.getElementById('lockhint'), barEl=document.querySelector('.bar');
+  var isLocked=false, lastIgnore=null, lastX=0, lastY=0, rectCache=[], rectAt=0, dragging=false, barTimer=null;
+  function canIPC(){ return !!(window.GrayIPC && window.GrayIPC.setIgnore); }
+  function setIgnore(v){ if(lastIgnore===v) return; lastIgnore=v; if(canIPC()) window.GrayIPC.setIgnore(v); }
+  function textRects(){
+    if(Date.now()-rectAt<600) return rectCache;
+    rectAt=Date.now(); var out=[];
+    [elSong,elCur,elNext].forEach(function(el){
+      if(!el||!el.firstChild) return;
+      var rg=document.createRange(); rg.selectNodeContents(el);
+      var rs=rg.getClientRects();
+      for(var i=0;i<rs.length;i++){ if(rs[i].width>1&&rs[i].height>1) out.push(rs[i]); }
+    });
+    rectCache=out; return out;
+  }
+  function inR(x,y,r){ return x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom; }
+  function boxHot(el,x,y){
+    if(!el) return false;
+    var r=el.getBoundingClientRect();
+    return r.width>1&&r.height>1&&inR(x,y,r);
+  }
+  function isHot(x,y){
+    if(isLocked) return boxHot(hintBtn,x,y);
+    if(boxHot(barEl,x,y)) return true;
+    var rs=textRects();
+    for(var i=0;i<rs.length;i++){ if(inR(x,y,rs[i])) return true; }
+    return false;
+  }
+  function showBar(){ if(barTimer){ clearTimeout(barTimer); barTimer=null; } if(barEl) barEl.classList.add('on'); }
+  function scheduleHideBar(){
+    if(barTimer||!barEl) return;
+    barTimer=setTimeout(function(){ barTimer=null; if(barEl) barEl.classList.remove('on'); },3000);
+  }
+  document.addEventListener('mousemove', function(e){
+    if(!canIPC()) return;
+    lastX=e.clientX; lastY=e.clientY;
+    if(dragging) return;
+    var hot=isHot(lastX,lastY);
+    setIgnore(!hot);
+    if(hot) showBar(); else scheduleHideBar();
+  });
+  document.addEventListener('mouseleave', function(){ if(!dragging) setIgnore(true); });
+  function endDrag(){
+    if(!dragging) return;
+    dragging=false;
+    if(window.GrayIPC&&window.GrayIPC.dragEnd) window.GrayIPC.dragEnd();
+    setIgnore(!isHot(lastX,lastY));
+  }
+  document.addEventListener('mousedown', function(e){
+    if(isLocked||dragging) return;
+    if(!(window.GrayIPC&&window.GrayIPC.dragStart)) return;
+    var t=e.target;
+    if(!(t===elSong||t===elCur||t===elNext)) return;
+    dragging=true;
+    e.preventDefault();
+    window.GrayIPC.dragStart();
+  });
+  document.addEventListener('mouseup', endDrag);
+  window.addEventListener('blur', endDrag);
   if(window.GrayIPC){
     lockBtn.onclick=function(){ window.GrayIPC.setLock(true); };
-    window.GrayIPC.onLockState(function(v){ document.body.classList.toggle('locked',!!v); });
+    hintBtn.onclick=function(){ window.GrayIPC.setLock(false); };
+    window.GrayIPC.onLockState(function(v){
+      isLocked=!!v;
+      document.body.classList.toggle('locked',isLocked);
+      rectAt=0;
+      setIgnore(isLocked?true:!isHot(lastX,lastY));
+    });
+    setIgnore(true);
+    window.__lyrDbg=function(x,y){return {ignore:lastIgnore,hot:isHot(x,y),locked:isLocked};};
   } else {
     lockBtn.style.display='none';
+    hintBtn.style.display='none';
   }
   document.getElementById('fdown').onclick=function(){ scale=Math.max(0.7,scale-0.1); applyScale(); saveScale(); };
   document.getElementById('fup').onclick=function(){ scale=Math.min(1.8,scale+0.1); applyScale(); saveScale(); };
@@ -3163,8 +3788,15 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
   function nudge(v){
     fetch('/api/live',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nudge:v})}).then(poll);
   }
+  function swapText(el,txt){
+    if(el.textContent===txt) return;
+    el.textContent=txt;
+    el.classList.remove('swap');
+    void el.offsetWidth;
+    el.classList.add('swap');
+  }
   function setLine(cur,next,empty){
-    if(elCur.textContent!==cur) elCur.textContent=cur;
+    if(elCur.textContent!==cur) swapText(elCur,cur);
     elCur.classList.toggle('dim',!!empty);
     if(elNext.textContent!==next) elNext.textContent=next;
     lastIdx=-2;
@@ -3178,7 +3810,7 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
     lastIdx=idx;
     if(idx<0){ setLine('…','',true); return; }
     var nxt=(idx+1<lines.length)?lines[idx+1].text:'';
-    if(elCur.textContent!==lines[idx].text){ elCur.textContent=lines[idx].text; elCur.classList.remove('dim'); }
+    if(elCur.textContent!==lines[idx].text){ swapText(elCur,lines[idx].text); elCur.classList.remove('dim'); }
     if(elNext.textContent!==nxt) elNext.textContent=nxt;
   }
   function poll(){
@@ -3382,7 +4014,8 @@ async function biliQrPoll(key) {
 async function ncmQrCreate() {
   const r = await weapiRaw('/api/login/qrcode/unikey', { type: 1 });
   if (r.json.code !== 200 || !r.json.unikey) throw new Error('获取登录码失败: ' + (r.json.message || r.json.code));
-  return { text: r.json.unikey, key: r.json.unikey };
+  // 二维码内容必须是官网登录 URL, 只放裸 unikey 时 App 扫码会提示「暂不支持该类型」
+  return { text: 'https://music.163.com/login?codekey=' + r.json.unikey, key: r.json.unikey };
 }
 async function ncmQrPoll(key) {
   const r = await weapiRaw('/api/login/qrcode/client/login', { key, type: 1 });
@@ -3512,7 +4145,135 @@ http.createServer((rq, rs) => {
   if (rq.method === 'GET' && url === '/api/nowplaying') {
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     ensureSmWatcher();
+    if (pushFresh()) {
+      const now = Date.now() / 1000;
+      rs.end(JSON.stringify({ playing: pushState.status !== 'Paused', title: pushState.title, artist: pushState.artist, status: pushState.status, src: 'plugin', pos: pushLivePos(now), dur: pushState.dur, ncmId: pushState.ncmId }));
+      return;
+    }
     rs.end(JSON.stringify(smState));
+    return;
+  }
+  if (url === '/api/push' && (rq.method === 'POST' || rq.method === 'OPTIONS')) {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'content-type', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Cache-Control': 'no-store' });
+    if (rq.method === 'OPTIONS') return rs.end('{}');
+    let body = '';
+    rq.on('data', d => { body += d; if (body.length > 20000) { try { rq.destroy(); } catch (e) {} } });
+    rq.on('end', () => {
+      try {
+        const o = JSON.parse(body || '{}');
+        const pos = Number(o.pos), dur = Number(o.dur), t = Number(o.t);
+        const playing = o.status === 'Playing';
+        const srcTag = String(o.src || 'plugin');
+        if (srcTag !== 'cdp' && cdpFresh()) { rs.end('{"ok":true,"ignored":1}'); return; }
+        if (srcTag === 'cdp') cdpLastPushAt = Date.now();
+        pushState = {
+          playing,
+          title: String(o.title || ''),
+          artist: String(o.artist || ''),
+          album: String(o.album || ''),
+          ncmId: Number(o.ncmId) || 0,
+          src: srcTag,
+          status: playing ? 'Playing' : (o.status === 'Paused' ? 'Paused' : 'none'),
+          pos: Number.isFinite(pos) && pos >= 0 ? pos : -1,
+          dur: Number.isFinite(dur) && dur > 0 ? dur : 0,
+          posAt: Number.isFinite(t) && t > 0 ? t / 1000 : Date.now() / 1000,
+          atMs: Date.now(),
+        };
+        if (!pushLogged && pushState.title) {
+          pushLogged = true;
+          console.log('[bridge] 已收到网易云推送: ' + pushState.title + ' - ' + pushState.artist);
+        }
+        rs.end('{"ok":true}');
+      } catch (e) { rs.end('{"ok":false}'); }
+    });
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/lyric/cands') {
+    const sp = new URL(rq.url, 'http://x').searchParams;
+    const title = (sp.get('title') || '').trim(), artist = (sp.get('artist') || '').trim();
+    const dur = Number(sp.get('dur')) || 0;
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    if (!title) return rs.end(JSON.stringify({ ok: false, error: '缺少歌名' }));
+    (async () => {
+      try {
+        const cur = lyrIdxGet(title, artist);
+        const cands = await ncmSongCands(title, artist);
+        rs.end(JSON.stringify({
+          ok: true, dur,
+          current: cur ? { songId: cur.songId || '', name: cur.name || '', artist: cur.artist || '', durMs: cur.durMs || 0, saved: !!cur.lrc } : null,
+          cands: cands.slice(0, 12).map(c => ({
+            songId: String(c.song.id), name: c.song.name || '', artist: c.artist || '',
+            durMs: c.song.dt || 0,
+            diff: dur > 0 ? Math.round(Math.abs((c.song.dt || 0) / 1000 - dur)) : null,
+            current: !!(cur && cur.songId && String(cur.songId) === String(c.song.id)),
+          })),
+        }));
+      } catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+    })();
+    return;
+  }
+  if (rq.method === 'POST' && url === '/api/lyric/pick') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    let body = '';
+    rq.on('data', d => body += d);
+    rq.on('end', async () => {
+      try {
+        const o = JSON.parse(body || '{}');
+        const title = String(o.title || '').trim(), artist = String(o.artist || '').trim();
+        const songId = String(o.songId || '').replace(/[^0-9]/g, '');
+        if (!title || !songId) return rs.end(JSON.stringify({ ok: false, error: '参数不全' }));
+        const r = await lyricBySongId(songId);
+        const n = lrcLines(r.lrc).length;
+        if (n < 2 || isJunkLyric(r.lrc)) return rs.end(JSON.stringify({ ok: false, error: '这个版本没有可用歌词(纯音乐/占位), 换一个试试' }));
+        lyrIdxPut(title, artist, {
+          songId, name: String(o.name || title), artist: String(o.artistName || artist),
+          durMs: Number(o.durMs) || 0, lrc: r.lrc, tlrc: r.tlrc, manual: true,
+          audioDurMs: pushFresh() && pushState.dur > 0 ? Math.round(pushState.dur * 1000) : 0,
+          offset: lyrIdxOffset(title, artist),
+        });
+        LYRIC_CACHE.delete(title + '|' + artist);
+        // 正在放这首歌就直接重新加载, 不用等下一首
+        if (live.title === title && live.artist === artist) {
+          liveLoad(live.key, live.title, live.artist, pushFresh() ? pushState.dur : 0);
+        }
+        rs.end(JSON.stringify({ ok: true, songId, lines: n, name: String(o.name || title) }));
+      } catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+    });
+    return;
+  }
+  if (url === '/api/ncm/status') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    (async () => {
+      let portOpen = false;
+      try { const l = await cdpTargets(); portOpen = !!(l && l.length); } catch (e) {}
+      rs.end(JSON.stringify({ port: NCM_DEBUG_PORT, portOpen, injected: !!cdpInjectedAt, cdpLive: cdpFresh(), plugin: pushFresh(), src: pushState ? (pushState.src || 'plugin') : 'none', error: cdpErr }));
+    })();
+    return;
+  }
+  if (url === '/api/ncm/relaunch' && (rq.method === 'POST' || rq.method === 'OPTIONS')) {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    if (rq.method === 'OPTIONS') return rs.end('{}');
+    (async () => {
+      try { rs.end(JSON.stringify(Object.assign({ ok: true }, await ncmRelaunch()))); }
+      catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+    })();
+    return;
+  }
+  if (url === '/api/plugin/status') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    rs.end(JSON.stringify({ installed: bridgePluginInstalled(), path: BRIDGE_PLUGIN_PATH, connected: pushFresh(), title: pushState ? pushState.title : '', src: pushState ? (pushState.src || 'plugin') : (cdpFresh() ? 'cdp' : (smState.src || 'none')), cdp: cdpFresh() }));
+    return;
+  }
+  if (url === '/api/plugin/install' && (rq.method === 'POST' || rq.method === 'OPTIONS')) {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    if (rq.method === 'OPTIONS') return rs.end('{}');
+    try { rs.end(JSON.stringify({ ok: true, path: installBridgePlugin(), installed: true, needRestart: true })); }
+    catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+    return;
+  }
+  if (url === '/api/plugin/source') {
+    rs.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+    rs.end('// manifest.json\n' + BRIDGE_MANIFEST + '\n\n// main.js\n' + Buffer.from(BRIDGE_JS_B64, 'base64').toString('utf8'));
     return;
   }
   if (rq.method === 'GET' && url === '/api/lyric') {
@@ -3531,7 +4292,7 @@ http.createServer((rq, rs) => {
       return;
     }
     (async () => {
-      try { rs.end(JSON.stringify(await lyricFor(title, artist))); }
+      try { rs.end(JSON.stringify(await lyricFor(title, artist, Number(sp.get('dur')) || 0))); }
       catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
     })();
     return;
@@ -3540,20 +4301,7 @@ http.createServer((rq, rs) => {
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     (async () => {
       try {
-        const p = path.join(os.tmpdir(), 'grayicu_pos.ps1');
-        fs.writeFileSync(p, '\uFEFF' + OCR_PS, 'utf8');
-        const out = await new Promise((resolve, reject) => {
-          execFile('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', p],
-            { timeout: 8000, windowsHide: true, maxBuffer: 1048576 }, (err, stdout) => {
-              if (err && !String(stdout || '').trim()) return reject(new Error(err.killed ? '校准超时' : '校准失败'));
-              resolve(String(stdout || ''));
-            });
-        });
-        const line = out.split(/\r?\n/).map(x => x.trim()).filter(x => x.startsWith('{')).pop();
-        if (!line) throw new Error('没读到播放时间，请把网易云窗口露出来再试');
-        let j;
-        try { j = JSON.parse(line); } catch (e) { throw new Error('校准返回格式异常'); }
-        rs.end(JSON.stringify(j));
+        rs.end(JSON.stringify(await ocrPlayPos()));
       } catch (e) {
         rs.end(JSON.stringify({ ok: false, error: e.message || '校准失败' }));
       }
@@ -3675,11 +4423,14 @@ http.createServer((rq, rs) => {
       return;
     }
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-    rs.end(JSON.stringify({ ok: true, running: lyricWindowRunning() }));
+    rs.end(JSON.stringify({ ok: true, running: lyricWindowRunning(), installing: lyricInstalling }));
     return;
   }
   rs.writeHead(404); rs.end('not found');
 }).listen(PORT, HOST, () => {
   console.log(`GraySongICU 已启动: http://${HOST}:${PORT}`);
   console.log('免责声明: 仅供技术学习与个人使用, 云盘内容仅限本人收听');
+  setTimeout(ncmWatchdog, 2500);
+  const ncmTimer = setInterval(ncmWatchdog, 6000);
+  if (ncmTimer.unref) ncmTimer.unref();
 });

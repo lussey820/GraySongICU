@@ -4,6 +4,8 @@ const path = require('path');
 const fs = require('fs');
 
 const APP_URL = 'http://127.0.0.1:3210/desktop-lyrics';
+// 本机调试用: 9223 端口可连 CDP 检查歌词窗的命中测试
+app.commandLine.appendSwitch('remote-debugging-port', '9223');
 let win = null;
 let tray = null;
 let locked = false;
@@ -22,8 +24,7 @@ function saveState() {
 function applyLock(v) {
   locked = !!v;
   if (win && !win.isDestroyed()) {
-    win.setIgnoreMouseEvents(locked);
-    win.setFocusable(!locked);
+    // 是否鼠标穿透由渲染层按"鼠标是否在歌词/按钮上"决定, 这里只同步锁定状态
     try { win.webContents.send('lyric:lock-state', locked); } catch (e) {}
     if (!locked) win.showInactive();
   }
@@ -32,7 +33,7 @@ function applyLock(v) {
 function updateTrayMenu() {
   if (!tray) return;
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: '解锁歌词（Ctrl+Alt+L）', enabled: locked, click: () => applyLock(false) },
+    { label: '解锁歌词（Ctrl+Alt+Shift+L）', enabled: locked, click: () => applyLock(false) },
     { label: '锁定歌词（鼠标穿透）', enabled: !locked, click: () => applyLock(true) },
     { type: 'separator' },
     { label: '隐藏歌词', click: () => { if (win) win.hide(); } },
@@ -84,6 +85,10 @@ function createWindow() {
   win.setAlwaysOnTop(true, 'screen-saver');
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   win.loadURL(APP_URL);
+  // 默认整窗穿透, 鼠标移到歌词/按钮上时由渲染层发 IPC 关闭穿透
+  win.webContents.on('did-finish-load', () => {
+    try { win.setIgnoreMouseEvents(true, { forward: true }); } catch (e) {}
+  });
   win.once('ready-to-show', () => win.showInactive());
   win.on('moved', saveState);
   win.on('closed', () => { win = null; if (tray) { tray.destroy(); tray = null; } });
@@ -110,13 +115,35 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   ipcMain.on('lyric:set-lock', (e, v) => applyLock(v));
+  ipcMain.on('lyric:set-ignore', (e, v) => {
+    if (win && !win.isDestroyed()) {
+      try { win.setIgnoreMouseEvents(!!v, { forward: true }); } catch (err) {}
+    }
+  });
+  // 拖动窗口: 渲染层按下歌词文字 -> 主进程用全局光标位置跟随移动
+  let dragTimer = null, dragFrom = null, dragWin = null;
+  const endDrag = () => { if (dragTimer) { clearInterval(dragTimer); dragTimer = null; } dragFrom = null; };
+  ipcMain.on('lyric:drag-start', () => {
+    if (!win || win.isDestroyed()) return;
+    endDrag();
+    const cur = screen.getCursorScreenPoint();
+    const b = win.getBounds();
+    dragFrom = { x: cur.x, y: cur.y };
+    dragWin = { x: b.x, y: b.y };
+    dragTimer = setInterval(() => {
+      if (!win || win.isDestroyed() || !dragFrom) return;
+      const c = screen.getCursorScreenPoint();
+      win.setPosition(dragWin.x + (c.x - dragFrom.x), dragWin.y + (c.y - dragFrom.y));
+    }, 16);
+  });
+  ipcMain.on('lyric:drag-end', endDrag);
 
   app.whenReady().then(() => {
     app.setAppUserModelId('com.grayicu.lyric');
     createWindow();
     createTray();
-    // 锁定时窗口鼠标穿透，必须留一个全局快捷键用于解锁
-    globalShortcut.register('CommandOrControl+Alt+L', () => applyLock(!locked));
+    // 锁定时窗口鼠标穿透，快捷键只作为备用（避开网易云 Ctrl+Alt+L 的"我喜欢"）
+    globalShortcut.register('CommandOrControl+Alt+Shift+L', () => applyLock(!locked));
   });
 
   app.on('will-quit', () => globalShortcut.unregisterAll());

@@ -5,6 +5,9 @@ bilibili_cookie.txt
 # 本地上传历史 (含个人使用记录)
 history.json
 
+# 本地歌词索引 (含个人使用记录)
+lyrics.json
+
 # 临时/测试产物
 *.mp3
 *.m4a
