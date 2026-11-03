@@ -26,6 +26,11 @@ node_modules/
 server.out.log
 server.err.log
 
+# 本地语音模型与环境 (体积大, 不入库)
+asr/models/
+asr/.venv/
+asr/__pycache__/
+
 # 本地协作工具产物 (设计参考稿/助手记忆, 非项目本体)
 .workbuddy/
 design/

@@ -68,6 +68,58 @@ function req(method, url, headers, body, isBinary, timeoutMs = 60000) {
 async function getJSON(url, headers, timeoutMs) {
   return JSON.parse((await req('GET', url, headers, null, false, timeoutMs)).text);
 }
+
+// ---------- 苹果播客 (Apple Podcasts / iTunes 中国区公开接口) ----------
+// 搜索节目 + 拉取单集, 单集自带音频直链, 不需要登录
+function appleJSON(url) {
+  return getJSON(url, { 'User-Agent': UA }, 25000);
+}
+async function appleSearch(kw) {
+  const j = await appleJSON('https://itunes.apple.com/search?term=' + encodeURIComponent(kw) + '&media=podcast&country=cn&limit=20');
+  return (j.results || []).filter(r => r.collectionId).map(r => ({
+    collectionId: String(r.collectionId),
+    name: decodeEntities(r.collectionName || r.trackName || '播客'),
+    artist: decodeEntities(r.artistName || ''),
+    count: r.trackCount || 0,
+    artwork: r.artworkUrl100 || r.artworkUrl600 || '',
+    link: 'https://podcasts.apple.com/cn/podcast/id' + r.collectionId,
+  }));
+}
+async function appleEpisodes(collectionId) {
+  const j = await appleJSON('https://itunes.apple.com/lookup?id=' + encodeURIComponent(collectionId) + '&entity=podcastEpisode&country=cn&limit=100');
+  return (j.results || []).filter(r => r.wrapperType === 'podcastEpisode' && r.episodeUrl).map(r => ({
+    episodeId: String(r.trackId || ''),
+    name: decodeEntities(r.trackName || '播客单集'),
+    show: decodeEntities(r.collectionName || ''),
+    durationMs: Number(r.trackTimeMillis || 0),
+    date: r.releaseDate || '',
+    url: r.episodeUrl,
+    link: 'https://podcasts.apple.com/cn/podcast/id' + (r.collectionId || collectionId) + (r.trackId ? '?i=' + r.trackId : ''),
+  }));
+}
+// 音频扩展名/类型推断 + HEAD 预取体积(避免白下载 200MB+)
+function extFromType(ct) {
+  const s = String(ct || '').toLowerCase();
+  if (/mpeg|mp3/.test(s)) return 'mp3';
+  if (/mp4|m4a|x-m4a/.test(s)) return 'm4a';
+  if (/aac/.test(s)) return 'aac';
+  if (/flac/.test(s)) return 'flac';
+  if (/ogg|opus/.test(s)) return 'ogg';
+  if (/wav/.test(s)) return 'wav';
+  return null;
+}
+function contentTypeFor(ext) {
+  return { mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac', ogg: 'audio/ogg', wav: 'audio/wav' }[ext] || 'application/octet-stream';
+}
+async function probeAudio(url, referer) {
+  try {
+    const h = await req('HEAD', url, { 'User-Agent': UA, ...(referer ? { Referer: referer } : {}) }, null, false, 20000);
+    const len = Number((h.headers && h.headers['content-length']) || 0);
+    return { size: Number.isFinite(len) ? len : 0, contentType: String((h.headers && h.headers['content-type']) || '') };
+  } catch (e) {
+    return { size: 0, contentType: '' };
+  }
+}
 // 限时竞速: 超过ms毫秒未完成则放弃等待(底层请求仍有自身超时兜底)
 function withTimeout(p, ms, msg) {
   return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
@@ -246,7 +298,12 @@ async function ncmPlaylists() {
   const uid = await ncmUid();
   const j = await ncmReq('/api/user/playlist', { uid, limit: 100, offset: 0, includeVideo: false });
   if (j.code !== 200) throw new Error('歌单读取失败: ' + (j.message || j.code));
-  return (j.playlist || []).map(p => ({ id: p.id, name: p.name, count: p.trackCount || 0, special: p.specialType === 5 }));
+  const mine = Number(uid);
+  return (j.playlist || []).map(p => ({
+    id: p.id, name: p.name, count: p.trackCount || 0, special: p.specialType === 5,
+    // 只有自己创建的歌单才能加歌, 收藏来的歌单没有操作权限
+    own: Number(p.userId || (p.creator && p.creator.userId) || 0) === mine,
+  }));
 }
 // 「我喜欢的音乐」歌单 id (specialType=5)
 async function likedPlaylistId() {
@@ -405,10 +462,10 @@ async function scanPlaylist(pid) {
   }
   return { id: pl.id, name: pl.name, total: pl.trackCount || (pl.tracks || []).length, gray, vip };
 }
-// 歌单增删曲目: 加一律进「我喜欢的音乐」, 删从指定歌单移除
+// 歌单增删曲目: 加默认进「我喜欢的音乐」, 也可指定歌单; 删从指定歌单移除
 async function editPlaylistTracks({ op, pid, ids }) {
   let target = Number(pid);
-  if (op === 'add') {
+  if (op === 'add' && (!Number.isFinite(target) || target <= 0)) {
     target = await likedPlaylistId();
     if (!target) throw new Error('找不到「我喜欢的音乐」歌单');
   }
@@ -888,20 +945,73 @@ function parseInputs(raw) {
   const arr = Array.isArray(raw) ? raw : String(raw || '').split(/[,，\r\n]+/);
   return arr.map(s => String(s).trim()).filter(Boolean);
 }
-// 小宇宙单集: https://www.xiaoyuzhoufm.com/episode/{id}
+// 播客单集: 小宇宙 https://www.xiaoyuzhoufm.com/episode/{id}
+// 苹果播客 https://podcasts.apple.com/cn/podcast/.../id{collectionId}?i={episodeId}
 function parsePodcast(input) {
-  const m = String(input || '').match(/xiaoyuzhoufm\.com\/episode\/([0-9a-zA-Z]+)/);
-  return m ? { id: m[1], url: 'https://www.xiaoyuzhoufm.com/episode/' + m[1] } : null;
+  const s = String(input || '');
+  const xy = s.match(/xiaoyuzhoufm\.com\/episode\/([0-9a-zA-Z]+)/);
+  if (xy) return { kind: 'xiaoyuzhou', id: xy[1], url: 'https://www.xiaoyuzhoufm.com/episode/' + xy[1] };
+  const ap = s.match(/podcasts\.apple\.com\/[^?#]*\/id(\d+)(?:[^#]*?[?&]i=(\d+))?/i);
+  if (ap) return {
+    kind: 'apple',
+    collectionId: ap[1],
+    episodeId: ap[2] || null,
+    url: 'https://podcasts.apple.com/cn/podcast/id' + ap[1] + (ap[2] ? '?i=' + ap[2] : ''),
+  };
+  return null;
 }
 function decodeEntities(s) {
   return String(s || '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ');
 }
 
-// 小宇宙播客单集: 页面公开 og:audio 直链, 下载后复用云盘上传链路
 async function podcastUpload(input, opts, send) {
   const pc = parsePodcast(input);
-  if (!pc) throw new Error('无法解析小宇宙单集链接: ' + input);
+  if (!pc) throw new Error('无法解析播客链接: ' + input);
+  if (pc.kind === 'apple') return applePodcastUpload(pc, opts, send);
+  return xiaoyuzhouUpload(pc, opts, send);
+}
+
+// 苹果播客单集: 公开接口返回音频直链, 下载后复用云盘上传链路
+async function applePodcastUpload(pc, opts, send) {
+  send('正在获取播客信息...');
+  let ep;
+  const list = await appleEpisodes(pc.collectionId);
+  if (!list.length) throw new Error('这个播客暂时没有公开音频的单集');
+  if (pc.episodeId) {
+    ep = list.find(x => x.episodeId === pc.episodeId);
+    if (!ep) throw new Error('这期播客不在公开单集里（可能已下架或为付费内容）');
+  } else {
+    ep = list[0];
+    send('没有指定单集, 将上传最新一期: ' + ep.name);
+  }
+  const probe = await probeAudio(ep.url, 'https://podcasts.apple.com/');
+  const ext = extFromType(probe.contentType) || ((ep.url.match(/\.(mp3|m4a|aac|flac|ogg|wav)(?:[?#]|$)/i) || [])[1] || 'm4a').toLowerCase();
+  const knownSize = probe.size;
+  send(`「${ep.name}」 · ${ep.show}${knownSize ? ' · ' + (knownSize / 1048576).toFixed(1) + 'MB' : ''}`);
+  if (knownSize > MAX_CLOUD_BYTES && !opts.split) {
+    const e = new Error(`这期 ${(knownSize / 1048576).toFixed(0)}MB, 超过云盘单文件 200MB 上限`);
+    e.needSplit = { size: knownSize, ext, canSplit: ext === 'mp3' || ext === 'm4a', title: ep.name, pub: ep.show };
+    throw e;
+  }
+
+  send('正在下载音频...');
+  const buf = await req('GET', ep.url, { 'User-Agent': UA, 'Referer': 'https://podcasts.apple.com/' }, null, true);
+  send(`已下载 ${(buf.length / 1048576).toFixed(2)}MB`);
+
+  const songName = sanitize(opts.song || ep.name);
+  const artist = sanitize(opts.artist || ep.show || '苹果播客');
+  const ups = await uploadAudioAuto({
+    buffer: buf, ext, filename: songName + '.' + ext,
+    song: songName, artist, album: '', contentType: contentTypeFor(ext), send, split: !!opts.split,
+  });
+  ups.forEach(u => appendHistory({ source: '播客', url: ep.link, song: u.song, artist, songId: u.songId, size: u.size }));
+  send(`✓ 上传完成${ups.every(u => u.instant) ? ' (秒传)' : ''}${ups.length > 1 ? `, 共 ${ups.length} 段` : ''}`);
+  return ups.map(u => ({ input: ep.link, song: u.song, songId: u.songId, ok: true, instant: u.instant }));
+}
+
+// 小宇宙播客单集: 页面公开 og:audio 直链, 下载后复用云盘上传链路
+async function xiaoyuzhouUpload(pc, opts, send) {
   send('正在获取播客信息...');
   const page = await req('GET', pc.url, { 'User-Agent': UA, 'Referer': 'https://www.xiaoyuzhoufm.com/' });
   if (page.status !== 200) throw new Error('播客页面打开失败 (' + page.status + ')');
@@ -937,6 +1047,56 @@ async function podcastUpload(input, opts, send) {
   ups.forEach(u => appendHistory({ source: '播客', url: pc.url, song: u.song, artist, songId: u.songId, size: u.size }));
   send(`✓ 上传完成${ups.every(u => u.instant) ? ' (秒传)' : ''}${ups.length > 1 ? `, 共 ${ups.length} 段` : ''}`);
   return ups.map(u => ({ input: pc.url, song: u.song, songId: u.songId, ok: true, instant: u.instant }));
+}
+
+// ---------- 通用音频直链上传: 粘贴 https://...mp3/m4a 即可 ----------
+function isPrivateHost(h) {
+  const s = String(h || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (s === 'localhost' || s === '0.0.0.0' || s.endsWith('.local') || s === '::1') return true;
+  if (/^127\./.test(s) || /^10\./.test(s) || /^192\.168\./.test(s) || /^169\.254\./.test(s)) return true;
+  const m = s.match(/^172\.(\d+)\./);
+  return !!(m && Number(m[1]) >= 16 && Number(m[1]) <= 31);
+}
+function parseAudioUrl(input) {
+  const s = String(input || '').trim();
+  if (!/^https?:\/\//i.test(s)) return null;
+  if (/bilibili\.com|b23\.tv|xiaoyuzhoufm\.com|podcasts\.apple\.com/i.test(s)) return null;
+  let u;
+  try { u = new URL(s); } catch (e) { return null; }
+  if (isPrivateHost(u.hostname)) return null;
+  const m = u.pathname.match(/\.(mp3|m4a|aac|flac|ogg|wav)$/i);
+  return m ? { url: s, ext: m[1].toLowerCase() } : null;
+}
+async function audioUrlUpload(a, opts, send) {
+  let u;
+  try { u = new URL(a.url); } catch (e) { throw new Error('音频链接格式不正确'); }
+  const probe = await probeAudio(a.url);
+  const ext = extFromType(probe.contentType) || a.ext;
+  let title = '';
+  try { title = decodeURIComponent((u.pathname.split('/').pop() || '').replace(/\.(mp3|m4a|aac|flac|ogg|wav)$/i, '')); }
+  catch (e) { title = (u.pathname.split('/').pop() || '').replace(/\.(mp3|m4a|aac|flac|ogg|wav)$/i, ''); }
+  title = sanitize(title || '音频文件');
+  const knownSize = probe.size;
+  if (knownSize > MAX_CLOUD_BYTES && !opts.split) {
+    const e = new Error(`这个文件 ${(knownSize / 1048576).toFixed(0)}MB, 超过云盘单文件 200MB 上限`);
+    e.needSplit = { size: knownSize, ext, canSplit: ext === 'mp3' || ext === 'm4a', title, pub: '' };
+    throw e;
+  }
+  send(`正在下载「${title}」...`);
+  const buf = await req('GET', a.url, { 'User-Agent': UA }, null, true);
+  send(`已下载 ${(buf.length / 1048576).toFixed(2)}MB`);
+
+  const songName = sanitize(opts.song || title);
+  const artist = sanitize(opts.artist || '直链音频');
+  // 播客/助眠里的直链也归入播客, 避免把助眠/播客音频送进歌词批处理
+  const source = (opts.type === 'pod' || opts.type === 'sleep') ? '播客' : '直链';
+  const ups = await uploadAudioAuto({
+    buffer: buf, ext, filename: songName + '.' + ext,
+    song: songName, artist, album: '', contentType: contentTypeFor(ext), send, split: !!opts.split,
+  });
+  ups.forEach(x => appendHistory({ source, url: a.url, song: x.song, artist, songId: x.songId, size: x.size }));
+  send(`✓ 上传完成${ups.every(x => x.instant) ? ' (秒传)' : ''}${ups.length > 1 ? `, 共 ${ups.length} 段` : ''}`);
+  return ups.map(x => ({ input: a.url, song: x.song, songId: x.songId, ok: true, instant: x.instant }));
 }
 
 
@@ -993,6 +1153,7 @@ async function runJobs(inputs, opts, send) {
     }
     const season = parseSeason(item);
     const podcast = parsePodcast(item);
+    const audio = parseAudioUrl(item);
     try {
       if (podcast) {
         send(`\n##### 第 ${i + 1}/${inputs.length} 个任务: 播客 #####`);
@@ -1000,6 +1161,9 @@ async function runJobs(inputs, opts, send) {
       } else if (season) {
         send(`\n##### 第 ${i + 1}/${inputs.length} 个任务: 合集 #####`);
         results.push(...await seasonUpload(season, opts, send));
+      } else if (audio) {
+        send(`\n##### 第 ${i + 1}/${inputs.length} 个任务: 音频直链 #####`);
+        results.push(...await audioUrlUpload(audio, opts, send));
       } else {
         send(`\n##### 第 ${i + 1}/${inputs.length} 个任务 #####`);
         results.push(...await biliUpload(item, opts, send));
@@ -1139,8 +1303,8 @@ async function biliUpload(input, opts, send) {
         results.push({ page: pg.page, song: up.song, songId: up.songId, ok: true, instant: up.instant });
         appendHistory({ bvid, page: pg.page, song: up.song, artist, songId: up.songId, size: up.size || buf.length });
       });
-      // 此时已知本段音频精确时长(pg.duration), 是挑对歌词版本的最佳时机
-      if (ups.length === 1 && pg.duration > 0) indexLyricForSong(songName, artist, pg.duration, send);
+      // 优先用B站自带字幕(与音源同源), 没有或对不上再联网匹配
+      if (ups.length === 1 && pg.duration > 0) await attachBiliLyric(bvid, pg, songName, artist, send);
       send(`✓ 上传完成${ups.every(up => up.instant) ? ' (秒传)' : ''}${ups.length > 1 ? `, 共 ${ups.length} 段` : ''}`);
     } catch (e) {
       if (e.needSplit) throw e;
@@ -1169,9 +1333,13 @@ let pushState = null;
 let pushLogged = false;
 function pushFresh() { return !!pushState && Date.now() - pushState.atMs < 5000; }
 function pushLivePos(now) {
-  const base = Number(pushState.pos) || 0;
+  // 用单调锚点: 插件每秒都会推一次, 但真正的进度事件可能不触发(推上来的 pos 原地踏步),
+  // 这时不能让 pos 每秒被重置回 0, 否则歌词永远停在第一句之前
+  const base = Number(pushState.monoPos != null ? pushState.monoPos : pushState.pos) || 0;
   if (pushState.status === 'Paused') return base;
-  return base + Math.max(0, now - (Number(pushState.posAt) || now));
+  let p = base + Math.max(0, now - (Number(pushState.monoAt) || now));
+  if (pushState.dur > 0) p = Math.min(p, pushState.dur);
+  return p;
 }
 
 const SM_PS = [
@@ -1321,6 +1489,21 @@ function bridgeSrcForCdp() {
     .replace(
       "status: S.playing ? 'Playing' : 'Paused',",
       "status: S.playing ? 'Playing' : 'Paused', src: 'cdp',"
+    )
+    // 网易云内部路由切换后模块缓存会换掉, 旧的 require 找不到 store 就再也拿不到元数据,
+    // 这里定时重新取一次 require/store, 避免桥接"假死"后再也不上报
+    .replace(
+      'if (!store) store = findStore(req);',
+      'if (!store && Date.now() - (window.__icuRetryAt || 0) > 4000) { window.__icuRetryAt = Date.now(); getRequire().then(function (r2) { if (r2) { req = r2; store = findStore(r2); } }); }'
+    )
+    // 心跳: 只有真正上报成功才刷新, 长时间没上报才允许再注入一份新实例
+    .replace(
+      'if (!S.known) return;',
+      'if (!S.known) return;\n\t\twindow.__icuBridgeCdpAt = Date.now();'
+    )
+    .replace(
+      'if (window.__icuBridgeCdp) return;',
+      'if (window.__icuBridgeCdp && Date.now() - (window.__icuBridgeCdpAt || 0) < 20000) return;'
     );
 }
 async function ensureCdp() {
@@ -1366,6 +1549,17 @@ async function ncmRunning() {
   const r = await psRun("if (Get-Process cloudmusic -ErrorAction SilentlyContinue) { 'ON' } else { 'OFF' }", 8000);
   return r.out.indexOf('ON') >= 0;
 }
+// 读网易云进程的命令行, 判断这次是不是带 --remote-debugging-port 启动的
+let ncmLaunch = { at: 0, running: false, withPort: false, port: 0, cmdline: '' };
+async function ncmLaunchInfo(force) {
+  if (!force && Date.now() - ncmLaunch.at < 15000) return ncmLaunch;
+  const q = "$p = Get-CimInstance Win32_Process -Filter \"Name='cloudmusic.exe'\" -ErrorAction SilentlyContinue | Select-Object -First 1; if ($p) { $p.CommandLine }";
+  const r = await psRun(q, 10000);
+  const line = (String(r.out || '').split(/\r?\n/)[0] || '').trim();
+  const m = line.match(/--remote-debugging-port=(\d+)/i);
+  ncmLaunch = { at: Date.now(), running: !!line, withPort: !!m, port: m ? Number(m[1]) : 0, cmdline: line };
+  return ncmLaunch;
+}
 // 杀掉没带参数的网易云, 再用 WMI 创建一个脱离本进程的带参数实例(否则本命令一结束它就被回收)
 async function ncmRelaunch() {
   const exe0 = await ncmExePath();
@@ -1383,6 +1577,7 @@ async function ncmRelaunch() {
     try { list = await cdpTargets(); if (list && list.length) break; } catch (e) {}
   }
   if (!list || !list.length) throw new Error('已启动, 但调试端口没起来(客户端可能忽略该参数)');
+  ncmLaunch = { at: Date.now(), running: true, withPort: true, port: NCM_DEBUG_PORT, cmdline: argLine };
   await ensureCdp();
   return { exe: exe0, port: NCM_DEBUG_PORT };
 }
@@ -1391,9 +1586,15 @@ async function ncmWatchdog() {
   if (cdpFresh()) return;
   await ensureCdp();
   if (pushFresh() || cdpFresh() || Date.now() - ncmAutoAt < 60000) return;
-  if (!(await ncmRunning())) return;
+  if (!(await ncmRunning())) { await ncmLaunchInfo(true); return; }
+  // 每次都验一次“是否带参数启动”: 带参数但仍注入失败就不再盲目重启, 只记录原因
+  const li = await ncmLaunchInfo(true);
+  if (li.withPort) {
+    if (!cdpErr) cdpErr = '调试端口已开(' + li.port + ')但注入失败';
+    return;
+  }
   ncmAutoAt = Date.now();
-  console.log('[cdp] 网易云没带调试参数, 自动重启以启用直连…');
+  console.log('[cdp] 网易云未带 --remote-debugging-port 启动, 自动重启以启用直连…');
   try { await ncmRelaunch(); console.log('[cdp] 直连已启用'); }
   catch (e) { console.log('[cdp] 自动重启失败: ' + e.message); }
 }
@@ -1463,7 +1664,7 @@ const LYRIC_CACHE = new Map();
 // ---------- 歌词索引: 歌名|歌手 → 选定的网易云版本(按时长匹配) + 手动偏移 ----------
 // 零依赖: 就是一个 JSON 文件, 比"每次重新猜版本"稳定得多
 const LYRIDX_PATH = path.join(DIR, 'lyrics.json');
-let lyridx = null, lyridxSaveTimer = null;
+let lyridx = null, lyridxSaveTimer = null, lyridxAudited = false;
 function lyridxLoad() {
   if (lyridx) return lyridx;
   try {
@@ -1472,7 +1673,45 @@ function lyridxLoad() {
   } catch (e) {
     lyridx = { version: 1, items: {} };
   }
+  if (!lyridxAudited) auditLyridx();
   return lyridx;
+}
+// 装载时对磁盘缓存做一次二次校验: 边开发边测试留下的脏歌词不能一直沿用
+function auditLyridx() {
+  lyridxAudited = true;
+  const items = lyridx.items || {};
+  let dropped = 0;
+  const samples = [];
+  for (const k of Object.keys(items)) {
+    const it = items[k];
+    if (!it || !it.lrc) continue;
+    const durSec = (Number(it.audioDurMs) || Number(it.durMs) || 0) / 1000;
+    const v = lrcAudit(it.lrc, { durSec, minLines: 3 });
+    if (!v.ok) {
+      delete items[k];
+      dropped++;
+      if (samples.length < 5) samples.push((it.name || k) + '(' + v.reason + ')');
+    }
+  }
+  // 修复历史遗留的坏 key: 空歌手键与记录字段不一致、重复项、测试/乱码条目
+  for (const k of Object.keys(items)) {
+    const it = items[k];
+    if (!it) continue;
+    const name = String(it.name || '').trim();
+    if (!name || /^[?？]+$/.test(name) || /zztest/i.test(k)) { delete items[k]; dropped++; continue; }
+    // 只有空歌手键才可能是 key 与记录不一致; 正常键以查询时的歌名/歌手为准, 不能按记录改
+    if (!k.endsWith('|')) continue;
+    const nk = lyricKey(name, it.artist);
+    if (nk === k) continue;
+    if (!items[nk]) items[nk] = it;
+    delete items[k];
+    dropped++;
+  }
+  if (!dropped) return;
+  try {
+    fs.writeFileSync(LYRIDX_PATH, JSON.stringify(lyridx, null, 2), 'utf8');
+    console.log('[歌词] 启动校验清理/修正歌词索引 ' + dropped + ' 条: ' + samples.join('、'));
+  } catch (e) { console.log('[歌词] 启动校验清理失败: ' + e.message); }
 }
 function lyricKey(title, artist) { return normTitle(title) + '|' + normTitle(artist); }
 function lyrIdxGet(title, artist) {
@@ -1497,6 +1736,15 @@ function lyrIdxSaveSoon() {
 }
 function lyrIdxPut(title, artist, patch) {
   if (!title) return null;
+  // 写入前二次校验: 脏歌词宁可不存, 也不能污染索引后被反复读出来
+  if (patch && patch.lrc) {
+    const durSec = (Number(patch.audioDurMs) || Number(patch.durMs) || 0) / 1000;
+    const v = lrcAudit(patch.lrc, { durSec, minLines: 3 });
+    if (!v.ok) {
+      console.log('[歌词] 拒绝写入脏数据: ' + title + ' (' + v.reason + ')');
+      return null;
+    }
+  }
   const it = lyridxLoad().items;
   const k = lyricKey(title, artist);
   const rec = it[k] || { name: title, artist: artist || '', offset: 0 };
@@ -1520,8 +1768,12 @@ async function lyricBySongId(id) {
 }
 // 已知真实音频时长时, 优先选时长最接近的候选(同名不同版本是歌词错位的根源)
 function pickCands(cands, durSec) {
-  if (!(durSec > 0)) return cands;
+  // 同名优先: 时长再接近, 也不能挑到另一首歌的歌词
+  const sameTitle = c => (c.ts === 4 ? 0 : 1);
   return cands.slice().sort((a, b) => {
+    const ta = sameTitle(a), tb = sameTitle(b);
+    if (ta !== tb) return ta - tb;
+    if (!(durSec > 0)) return b.sc - a.sc;
     const da = Math.abs((a.song.dt || 0) / 1000 - durSec);
     const db = Math.abs((b.song.dt || 0) / 1000 - durSec);
     if (Math.abs(da - db) > 0.5) return da - db;
@@ -1537,12 +1789,14 @@ async function indexLyricForSong(title, artist, durSec, send) {
     if (!cands.length) { if (send) send('[歌词] 没找到可匹配的版本, 播放时会再试'); return; }
     for (const c of cands.slice(0, 6)) {
       const r = await lyricBySongId(c.song.id);
-      if (lrcLines(r.lrc).length < 5 || isJunkLyric(r.lrc)) continue;
-      lyrIdxPut(title, artist, {
+      const v = lrcAudit(r.lrc, { durSec, minLines: 5 });
+      if (!v.ok) continue;
+      const rec = lyrIdxPut(title, artist, {
         songId: String(c.song.id), name: c.song.name || title, artist: c.artist,
         durMs: c.song.dt || 0, audioDurMs: Math.round((durSec || 0) * 1000),
         lrc: r.lrc, tlrc: r.tlrc,
       });
+      if (!rec) continue;
       if (send) send('[歌词] 已关联「' + (c.song.name || title) + '」 ' + Math.round((c.song.dt || 0) / 1000) + 's (本段 ' + Math.round(durSec || 0) + 's)');
       return;
     }
@@ -1554,6 +1808,465 @@ async function indexLyricForSong(title, artist, durSec, send) {
 
 function normTitle(s) {
   return String(s || '').toLowerCase().replace(/[\s\-_·・.。,，!？!?'"“”‘’()（）\[\]【】]/g, '');
+}
+
+// ---------- B站字幕 → LRC (方案3: 导入时把与音源同源的字幕时间轴存进本地) ----------
+// 注意: B站的 AI 字幕经常是解说词/剧情对白, 不是歌词, 必须和网易云歌词做文本比对才敢落库
+async function biliSubtitle(bvid, cid, H) {
+  const j = await getJSON(`https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}`, H);
+  if (j.code !== 0 || !j.data || !j.data.subtitle) return null;
+  const subs = (j.data.subtitle.subtitles || []).filter(s => s && s.subtitle_url);
+  if (!subs.length) return null;
+  // 人工中文字幕优先, AI 中文其次, 其余最后
+  const rank = s => (/^ai/i.test(String(s.lan || '')) ? 1 : 0);
+  subs.sort((a, b) => rank(a) - rank(b));
+  const s0 = subs[0];
+  let u = String(s0.subtitle_url);
+  if (u.startsWith('//')) u = 'https:' + u;
+  const sj = await getJSON(u, { 'User-Agent': UA, Referer: 'https://www.bilibili.com/' });
+  const body = Array.isArray(sj && sj.body) ? sj.body : [];
+  if (!body.length) return null;
+  return { lan: String(s0.lan || ''), lanDoc: String(s0.lan_doc || ''), body };
+}
+function lrcTime(s) {
+  const t = Math.max(0, Number(s) || 0);
+  const m = Math.floor(t / 60), sec = t - m * 60;
+  return '[' + String(m).padStart(2, '0') + ':' + (sec < 10 ? '0' : '') + sec.toFixed(2) + ']';
+}
+function subtitleToLrc(body) {
+  const out = [];
+  for (const it of body) {
+    // 歌词视频常用 ♪ 装饰首尾, 去掉后再入库, 免得歌词窗里都是音符
+    const t = String(it.content || '').replace(/\s+/g, ' ').replace(/^[♪♫\s]+|[♪♫\s]+$/g, '').trim();
+    const from = Number(it.from);
+    if (!t || !isFinite(from) || from < 0 || from > 21600) continue;
+    out.push(lrcTime(from) + t);
+  }
+  return out.join('\n');
+}
+// 字幕至少要像"一句一句的短句", 解说词那种长句/口水话在这里先筛掉一轮
+function looksLikeLyrics(body) {
+  const lines = body.map(x => String(x.content || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  if (lines.length < 8) return false;
+  const lens = lines.map(s => s.length).sort((a, b) => a - b);
+  const mid = lens[Math.floor(lens.length / 2)] || 0;
+  return mid <= 30;
+}
+// 搜不到网易云参考歌词时的严格启发式: 行数/行长/句末标点/解说词特征/时间覆盖都要像歌词
+function lyricLikeSubtitle(body, durSec) {
+  const lines = body.map(x => String(x.content || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+  if (lines.length < 10) return false;
+  const lens = lines.map(s => s.length).sort((a, b) => a - b);
+  const mid = lens[Math.floor(lens.length / 2)] || 0;
+  if (mid < 4 || mid > 26) return false;
+  // 解说词句末常带句号/感叹号, 歌词很少逐句带标点
+  const punct = lines.filter(s => /[。！？；]$/.test(s)).length / lines.length;
+  if (punct > 0.35) return false;
+  const narr = /^(大家好|欢迎(来到|收看)|本期|这期|下期|记得(点赞|关注)|一键三连|字幕(由|组)|可以看到|接下来|镜头|画面|剧情|解说)/;
+  if (lines.some(s => narr.test(s))) return false;
+  if (durSec > 0) {
+    let from = Infinity, to = -1;
+    for (const it of body) {
+      const f = Number(it.from), t = Number(it.to);
+      if (isFinite(f)) from = Math.min(from, f);
+      if (isFinite(t)) to = Math.max(to, t);
+    }
+    if (!(to > from)) return false;
+    if (from > durSec * 0.3) return false;
+    if (to < durSec * 0.6) return false;
+  }
+  return true;
+}
+// 字符二元组覆盖率: 歌词 ASR 文本和官方歌词会有同音误差, 但不会像"解说词"那样几乎不沾边
+function textOverlap(a, b) {
+  const grams = s => {
+    const set = new Set();
+    const t = String(s || '').toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
+    for (let i = 0; i + 1 < t.length; i++) set.add(t.slice(i, i + 2));
+    return set;
+  };
+  const ga = grams(a), gb = grams(b);
+  if (!ga.size || !gb.size) return 0;
+  let hit = 0;
+  for (const g of ga) if (gb.has(g)) hit++;
+  return hit / ga.size;
+}
+function lrcPlain(lrc) {
+  return String(lrc || '').split('\n').map(l => l.replace(/\[\d+:\d+(?:\.\d+)?\]/g, '')).join(' ');
+}
+// 只尝试B站自带字幕: 人工CC直接信任; AI字幕先和网易云参考比对, 搜不到再走严格启发式
+async function tryBiliSubtitle(bvid, pg, songName, artist, send) {
+  try {
+    const sub = await biliSubtitle(bvid, pg.cid, await biliHeaders());
+    if (!(sub && looksLikeLyrics(sub.body))) {
+      if (send) send('[歌词] B站没有可用字幕');
+      return false;
+    }
+    const lrc = subtitleToLrc(sub.body);
+    const humanCc = !/^ai/i.test(sub.lan);
+    let ok = humanCc;
+    let ov = 0;
+    let verify = humanCc ? 'human' : 'matched';
+    let refFound = false;
+    if (!ok) {
+      // AI 字幕: 优先和网易云歌词比对; 搜不到参考时再用严格启发式(标记未校对)
+      const ref = await lyricFor(songName, artist, pg.duration).catch(() => null);
+      refFound = !!(ref && ref.ok);
+      if (refFound) {
+        ov = textOverlap(lrc, ref.lrc);
+        ok = ov >= 0.18;
+      } else {
+        ok = lyricLikeSubtitle(sub.body, pg.duration);
+        if (ok) verify = 'none';
+      }
+    }
+    if (ok) {
+      const v = lrcAudit(lrc, { durSec: pg.duration, minLines: 5 });
+      if (v.ok) {
+        const rec = lyrIdxPut(songName, artist, {
+          name: songName, artist, songId: '',
+          durMs: Math.round((pg.duration || 0) * 1000), audioDurMs: Math.round((pg.duration || 0) * 1000),
+          lrc, tlrc: '', manual: true, source: 'bilibili', verify,
+          bvid, cid: pg.cid, biliLan: sub.lanDoc || sub.lan,
+        });
+        if (rec) {
+          LYRIC_CACHE.delete(songName + '|' + artist);
+          const tag = verify === 'none' ? '(未校对, 播放时会提示)' : '与音源同源';
+          if (send) send('[歌词] 已保存B站字幕(' + (sub.lanDoc || sub.lan || '字幕') + ' · ' + v.lines + ' 句, ' + tag + ')');
+          return true;
+        }
+      }
+    } else if (send) {
+      send(refFound
+        ? '[歌词] B站字幕和歌词对不上(重合 ' + Math.round(ov * 100) + '%)'
+        : '[歌词] B站字幕不像歌词');
+    }
+  } catch (e) {
+    if (send) send('[歌词] B站字幕读取失败: ' + e.message);
+  }
+  return false;
+}
+// 导入一段音频后: 先尝试 B站自带字幕, 通过校验就落库; 否则回退到联网匹配
+async function attachBiliLyric(bvid, pg, songName, artist, send) {
+  if (await tryBiliSubtitle(bvid, pg, songName, artist, send)) return true;
+  await indexLyricForSong(songName, artist, pg.duration, send);
+  return false;
+}
+
+// ---------- 手动离线预转: 用本地 whisper 听一遍 B站音频, 为没有时间轴的歌生成时间戳 ----------
+// 只在用户点「补时间轴」时跑单首, 不排队不自动; 结果标记 verify:'none', 播放时会提示未校对
+let sttBusy = false;
+let sttChild = null, sttStopping = false;
+function findHistoryBySong(title, artist, anySource) {
+  const list = readHistory();
+  const nt = normTitle(title), na = normTitle(artist);
+  if (!nt) return null;
+  const byTitle = [];
+  for (const h of list) {
+    if (!h) continue;
+    if (!anySource && (!h.bvid || !h.page)) continue;
+    const hs = normTitle(h.song);
+    if (!hs) continue;
+    if (!(hs === nt || hs.includes(nt) || nt.includes(hs))) continue;
+    byTitle.push(h);
+    const ha = normTitle(h.artist || '');
+    if (!na || !ha || ha === na || ha.includes(na) || na.includes(ha)) return h;
+  }
+  return byTitle[0] || null;
+}
+// whisper 的 segment 是"按停顿/标点切开的句子", 直接当歌词会一行太长, 长句按标点拆开并按字数分摊时间
+// 单字重复很多次的"寂寂寂…"是 whisper 在纯音乐段的典型幻觉, 直接丢掉
+function segmentsToLrc(segments) {
+  const out = [];
+  for (const s of segments || []) {
+    const text = String(s.text || '').replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    if (/^(谢谢观看|字幕由|请订阅|感谢观看|字幕组|未经授权)/.test(text)) continue;
+    if (/^(.)\1{7,}$/.test(text)) continue;                 // 整行单字重复≥8次的幻觉
+    const counts = {};
+    let top = 0;
+    for (const ch of text) { counts[ch] = (counts[ch] || 0) + 1; if (counts[ch] > top) top = counts[ch]; }
+    if (text.length > 10 && top / text.length > 0.7) continue; // 同一个字占了整行七成以上
+    const st = Math.max(0, Number(s.start) || 0);
+    const en = Math.max(st + 0.1, Number(s.end) || st + 1);
+    if (text.length <= 30 || !/[，,。；;！？!?、]/.test(text)) {
+      out.push({ t: st, text });
+      continue;
+    }
+    const parts = text.split(/[，,。；;！？!?、]+/).map(x => x.trim()).filter(x => x.length >= 2);
+    if (parts.length < 2) { out.push({ t: st, text }); continue; }
+    const total = parts.reduce((n, x) => n + x.length, 0) || 1;
+    let cur = st;
+    for (const p of parts) {
+      out.push({ t: cur, text: p });
+      cur += (en - st) * (p.length / total);
+    }
+  }
+  out.sort((a, b) => a.t - b.t);
+  return out.map(x => lrcTime(x.t) + x.text).join('\n');
+}
+function parseEarResult(stdout) {
+  const lines = String(stdout || '').split(/\r?\n/);
+  let lastErr = '';
+  for (const raw of lines) {
+    const l = raw.trim();
+    if (!l.startsWith('{')) continue;
+    let o = null;
+    try { o = JSON.parse(l); } catch (e) { continue; }
+    if (o && o.type === 'error') lastErr = o.message || '识别失败';
+    if (o && o.type === 'result') return o;
+  }
+  return lastErr ? { type: 'error', message: lastErr } : null;
+}
+async function biliPageInfo(bvid, page) {
+  const H = await biliHeaders();
+  const view = await getJSON(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, H);
+  if (view.code !== 0) throw new Error('B站视频信息获取失败: ' + view.message);
+  const pages = (view.data && view.data.pages) || [];
+  const pg = pages.find(p => Number(p.page) === Number(page)) || pages[0];
+  if (!pg) throw new Error('B站视频里找不到这段音频');
+  return { pg, title: (view.data && view.data.title) || '' };
+}
+// whisper 转写一个本地音频文件, 通过校验后写入歌词索引
+async function whisperFileToLyric(tmp, durSec, title, artist, send, extra) {
+  let timer = null;
+  const started = Date.now();
+  if (sttBusy) { try { fs.unlinkSync(tmp); } catch (e) {} throw new Error('本地识别正在忙, 请稍后再试'); }
+  sttBusy = true;
+  try {
+    const stdout = await new Promise((resolve, reject) => {
+      timer = setInterval(() => {
+        send('[补时间轴] 识别中… 已等待 ' + Math.round((Date.now() - started) / 1000) + 's');
+      }, 10000);
+      if (timer.unref) timer.unref();
+      sttStopping = false;
+      sttChild = execFile(ASR_PY, [ASR_SCRIPT, '--model', 'base', '--file', tmp],
+        { timeout: 900000, maxBuffer: 32 * 1048576, windowsHide: true },
+        (err, so, se) => {
+          sttChild = null;
+          if (err && !String(so || '').trim()) {
+            if (sttStopping) return reject(new Error('__canceled__'));
+            const tail = String(se || err.message || '').trim().split(/\r?\n/).pop();
+            return reject(new Error('本地识别失败: ' + (tail || err.message).slice(0, 160)));
+          }
+          resolve(String(so || ''));
+        });
+    });
+    const o = parseEarResult(stdout);
+    if (!o || o.type === 'error') throw new Error('本地识别失败: ' + ((o && o.message) || '没有返回结果'));
+    const lrc = segmentsToLrc(o.segments);
+    const v = lrcAudit(lrc, { durSec, minLines: 5 });
+    if (!v.ok) throw new Error('识别结果不像完整歌词(' + v.reason + '), 没有保存');
+    const rec = lyrIdxPut(title, artist, {
+      name: title, artist, songId: extra.songId || '',
+      durMs: Math.round(durSec * 1000), audioDurMs: Math.round(durSec * 1000),
+      lrc, tlrc: '', manual: true, source: 'whisper', verify: 'none',
+      bvid: extra.bvid || '', cid: extra.cid || '',
+    });
+    if (!rec) throw new Error('识别结果没通过校验, 没有保存');
+    LYRIC_CACHE.delete(title + '|' + artist);
+    if (live.title === title && live.artist === artist) {
+      liveLoad(live.key, live.title, live.artist, pushFresh() ? pushState.dur : 0);
+    }
+    send('[补时间轴] 完成: ' + v.lines + ' 句已保存, 来源为语音转写(未校对)');
+    return { lines: v.lines, duration: Math.round(durSec), bvid: extra.bvid || '', page: extra.page || 1 };
+  } finally {
+    sttBusy = false;
+    if (timer) clearInterval(timer);
+    try { fs.unlinkSync(tmp); } catch (e) {}
+  }
+}
+async function sttLyricForSong(title, artist, send, pre) {
+  if (!fs.existsSync(ASR_SCRIPT)) throw new Error('缺少 asr/transcribe.py, 无法本地转写');
+  if (!fs.existsSync(path.join(DIR, 'asr', '.venv', 'Scripts', 'python.exe'))) throw new Error('缺少本地识别环境 asr/.venv, 无法补时间轴');
+  if (!fs.existsSync(path.join(DIR, 'asr', 'models', 'faster-whisper-base'))) throw new Error('缺少 whisper 模型 asr/models/faster-whisper-base, 无法补时间轴');
+  // 拆分上传的分段只有一段音频, 拿整首时间轴会错位, 直接拒绝, 不写脏数据
+  if (/[（(]\d+\s*\/\s*\d+[）)]/.test(title)) {
+    throw new Error('这是超过 200MB 拆分上传的分段，时间轴无法可靠对齐，暂不支持补时间轴；请用完整的那一首');
+  }
+  if (sttBusy) throw new Error('本地识别正在忙, 请稍后再试');
+  const h = (pre && pre.h) || findHistoryBySong(title, artist, true);
+  if (!h) throw new Error('上传历史里找不到这首歌, 无法取回音频; 请先确认它是由本工具上传的');
+  // 没有B站音源(非播客的其他来源): 改用网易云云盘里自己上传的那份音频
+  if (!h.bvid || !h.page) return sttLyricFromCloud(title, artist, send, h);
+  send('[补时间轴] 找到音源: ' + h.bvid + ' 第' + h.page + '段 (' + (h.time || '') + ')');
+  let info = (pre && pre.pg) ? pre : null;
+  if (!info) {
+    send('[补时间轴] 读取B站视频信息…');
+    info = await biliPageInfo(h.bvid, h.page);
+  }
+  const pg = info.pg;
+  const H = await biliHeaders();
+  if (!(pg.duration > 0)) throw new Error('这段音频时长未知, 无法生成时间轴');
+  // 播客/长音频不做自动转写: 一首要跑很久, 且时间轴对播客没有意义
+  if (pg.duration > 1800) throw new Error('这段音频超过 30 分钟，不自动补时间轴（播客这类长音频不适用）');
+  send('[补时间轴] 取音频: ' + (pg.part || info.title || '') + ' · ' + Math.round(pg.duration) + 's');
+  const play = await getJSON(`https://api.bilibili.com/x/player/playurl?bvid=${h.bvid}&cid=${pg.cid}&fnval=16&fnver=0&qn=0`, H);
+  if (play.code === -101) throw new Error('B站登录已失效(-101), 请先更新B站cookie');
+  if (play.code !== 0 || !play.data.dash) throw new Error('playurl失败: ' + (play.message || '无DASH流'));
+  const picked = pickAudio(play.data.dash, 'best');
+  if (!picked || !picked.a) throw new Error('这段音频没有可下载的音频流');
+  const buf = await downloadAudio(picked.a, H, send);
+  send('[补时间轴] 已取到音频 ' + (buf.length / 1048576).toFixed(2) + 'MB, 开始本地识别(可能要几分钟, 请不要关闭页面)');
+  const ext = picked.a.id === 30251 ? '.flac' : '.m4a';
+  const tmp = path.join(os.tmpdir(), 'grayicu_stt_' + Date.now() + ext);
+  try { fs.writeFileSync(tmp, buf); }
+  catch (e) { throw new Error('临时文件写入失败: ' + e.message); }
+  return await whisperFileToLyric(tmp, pg.duration, title, artist, send, { bvid: h.bvid, cid: pg.cid });
+}
+// 从网易云云盘取回自己上传的那份音频再转写(适合没有B站音源的歌)
+async function sttLyricFromCloud(title, artist, send, h0) {
+  const a = asrReady();
+  if (!a.ready) throw new Error('本地转写不可用(' + a.reason + ')');
+  const h = h0 || findHistoryBySong(title, artist, true);
+  if (!h) throw new Error('上传历史里找不到这首歌, 无法取回音频');
+  if (!h.songId) throw new Error('上传历史里没有网易云 songId, 无法取回音频');
+  send('[补时间轴] 从网易云云盘取回音频…');
+  const r = await ncmReq('/api/song/enhance/player/url/v1', { ids: '[' + Number(h.songId) + ']', level: 'standard', encodeType: 'flac' });
+  const d = (r && r.data && r.data[0]) || null;
+  if (r.code !== 200 || !d || !d.url) throw new Error('网易云取音频失败(' + ((r && r.code) || '无播放地址') + ')');
+  const send2 = m => send(m);
+  send2('[补时间轴] 已获取播放地址, 开始下载…');
+  const buf = await req('GET', d.url, { 'User-Agent': 'Mozilla/5.0', Referer: 'https://music.163.com/' }, null, true);
+  const dur = Number(d.time) > 0 ? Number(d.time) / 1000 : 0;
+  if (dur > 1800) throw new Error('这段音频超过 30 分钟，不自动补时间轴');
+  send2('[补时间轴] 已取到音频 ' + (buf.length / 1048576).toFixed(2) + 'MB, 开始本地识别(可能要几分钟, 请不要关闭页面)');
+  const ext = /flac/i.test(String(d.type || '')) ? '.flac' : '.mp3';
+  const tmp = path.join(os.tmpdir(), 'grayicu_stt_' + Date.now() + ext);
+  try { fs.writeFileSync(tmp, buf); }
+  catch (e) { throw new Error('临时文件写入失败: ' + e.message); }
+  return await whisperFileToLyric(tmp, dur, title, artist, send, { songId: h.songId });
+}
+
+// ---------- 批量补歌词: 点「歌词」按钮后自动跑, 补上传历史里本机缺歌词的歌 ----------
+// 顺序: 先抓B站同源字幕(时间轴最准) → 再找网易云歌词(秒级) → 都没有才用 whisper 听B站音源; 全程可停止
+let LYR_BATCH = { running: false, canceled: false, total: 0, done: 0, okBili: 0, okNet: 0, okStt: 0, failed: 0, skipped: 0, current: '', lastSaved: '', log: [], startedAt: 0, finishedAt: 0, asrReady: true, asrReason: '' };
+function lyrBatchCandidates() {
+  const seen = new Set();
+  const out = [];
+  for (const h of readHistory()) {
+    const title = String((h && h.song) || '').trim();
+    const artist = String((h && h.artist) || '').trim();
+    if (!title) continue;
+    const key = lyricKey(title, artist);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    // 播客不做本地转写; 其他没有B站音源的歌仍可从网易云云盘取回音频转写
+    const isPod = (h.source === '播客') || /xiaoyuzhoufm\.com/i.test(String(h.url || ''));
+    if (isPod) continue;
+    if (/[（(]\d+\s*\/\s*\d+[）)]/.test(title)) { out.push({ title, artist, skip: '拆分上传的分段' }); continue; }
+    const idx = lyrIdxGet(title, artist);
+    if (idx && idx.lrc) {
+      const v = lrcAudit(idx.lrc, { durSec: Number(idx.audioDurMs || idx.durMs || 0) / 1000, minLines: 3 });
+      if (v.ok) continue; // 本机已有可用歌词
+    }
+    out.push({ title, artist });
+  }
+  return out;
+}
+function lyrBatchSnap() {
+  return {
+    running: LYR_BATCH.running, canceled: LYR_BATCH.canceled,
+    total: LYR_BATCH.total, done: LYR_BATCH.done,
+    online: LYR_BATCH.okNet, stt: LYR_BATCH.okStt, bili: LYR_BATCH.okBili,
+    failed: LYR_BATCH.failed, skipped: LYR_BATCH.skipped,
+    current: LYR_BATCH.current, lastSaved: LYR_BATCH.lastSaved, startedAt: LYR_BATCH.startedAt, finishedAt: LYR_BATCH.finishedAt,
+    asrReady: LYR_BATCH.asrReady, asrReason: LYR_BATCH.asrReason,
+    log: LYR_BATCH.log.slice(-15),
+  };
+}
+function lyrBatchLog(m) {
+  LYR_BATCH.log.push(m);
+  if (LYR_BATCH.log.length > 200) LYR_BATCH.log.splice(0, LYR_BATCH.log.length - 200);
+  console.log('[批量歌词] ' + m);
+}
+async function lyrBatchRun(list) {
+  const asr = asrReady();
+  LYR_BATCH = { running: true, canceled: false, total: list.length, done: 0, okBili: 0, okNet: 0, okStt: 0, failed: 0, skipped: 0, current: '', lastSaved: '', log: [], startedAt: Date.now(), finishedAt: 0, asrReady: asr.ready, asrReason: asr.reason };
+  lyrBatchLog('开始批量补歌词: ' + list.length + ' 首');
+  if (!asr.ready) lyrBatchLog('本地转写不可用(' + asr.reason + '), 只补 B站字幕和网易云歌词');
+  for (const it of list) {
+    if (LYR_BATCH.canceled) break;
+    LYR_BATCH.current = it.title + (it.artist ? ' · ' + it.artist : '');
+    if (it.skip) {
+      LYR_BATCH.skipped++; LYR_BATCH.done++;
+      lyrBatchLog('[' + LYR_BATCH.done + '/' + LYR_BATCH.total + '] 跳过「' + it.title + '」: ' + it.skip);
+      continue;
+    }
+    try {
+      const h = findHistoryBySong(it.title, it.artist, true);
+      if (!h) throw new Error('上传历史里找不到音源记录');
+      let pre = null, dur = 0, hasBili = !!(h.bvid && h.page);
+      if (hasBili) {
+        const info = await biliPageInfo(h.bvid, h.page);
+        pre = { h, pg: info.pg, title: info.title };
+        if (!(info.pg.duration > 0)) throw new Error('音频时长未知');
+        if (info.pg.duration > 1800) {
+          LYR_BATCH.skipped++; LYR_BATCH.done++;
+          lyrBatchLog('[' + LYR_BATCH.done + '/' + LYR_BATCH.total + '] 跳过「' + it.title + '」: 超过 30 分钟的音频');
+          continue;
+        }
+        dur = info.pg.duration;
+        // 1) B站自带字幕: 与音源同源, 时间轴最准
+        lyrBatchLog('[' + (LYR_BATCH.done + 1) + '/' + LYR_BATCH.total + '] 先找B站字幕「' + it.title + '」…');
+        if (await tryBiliSubtitle(h.bvid, info.pg, it.title, it.artist, m => lyrBatchLog('  ' + m))) {
+          LYR_BATCH.okBili++;
+          LYR_BATCH.lastSaved = it.title + '|' + it.artist;
+          LYR_BATCH.done++;
+          lyrBatchLog('  B站字幕已保存');
+          if (!LYR_BATCH.canceled) await new Promise(r => setTimeout(r, 1200));
+          continue;
+        }
+      } else {
+        lyrBatchLog('[' + (LYR_BATCH.done + 1) + '/' + LYR_BATCH.total + '] 「' + it.title + '」没有B站音源, 先找网易云歌词…');
+      }
+      // 2) 网易云歌词匹配
+      lyrBatchLog('  找网易云歌词…');
+      const r = await lyricFor(it.title, it.artist, dur);
+      if (r && r.ok) {
+        LYR_BATCH.okNet++;
+        LYR_BATCH.lastSaved = it.title + '|' + it.artist;
+        lyrBatchLog('  网易云歌词已保存(' + r.lines + ' 句' + (r.warn ? ' · ' + r.warn : '') + ')');
+      } else if (!asr.ready) {
+        // 没有 Python 环境: 跳过本地转写, 不计入失败
+        LYR_BATCH.skipped++; LYR_BATCH.done++;
+        lyrBatchLog('  网易云也没有歌词, 本地转写不可用(' + asr.reason + '), 跳过');
+        if (!LYR_BATCH.canceled) await new Promise(r => setTimeout(r, 1200));
+        continue;
+      } else {
+        // 3) 都没有才用本地 whisper 听音频
+        lyrBatchLog('  网易云没有可用歌词(' + ((r && (r.error || r.reason)) || '未知原因') + '), 最后用本地转写…');
+        const s = await sttLyricForSong(it.title, it.artist, m => lyrBatchLog('  ' + m), pre);
+        LYR_BATCH.okStt++;
+        LYR_BATCH.lastSaved = it.title + '|' + it.artist;
+        lyrBatchLog('  本地转写已保存(' + s.lines + ' 句, 未校对)');
+      }
+      LYR_BATCH.done++;
+    } catch (e) {
+      if (e.message === '__canceled__') { LYR_BATCH.canceled = true; break; }
+      LYR_BATCH.failed++; LYR_BATCH.done++;
+      lyrBatchLog('  失败: ' + e.message);
+    }
+    if (!LYR_BATCH.canceled) await new Promise(r => setTimeout(r, 1200));
+  }
+  LYR_BATCH.current = '';
+  LYR_BATCH.running = false;
+  LYR_BATCH.finishedAt = Date.now();
+  lyrBatchLog('批量补歌词结束: B站字幕 ' + LYR_BATCH.okBili + ' · 网易云 ' + LYR_BATCH.okNet + ' · 本地 ' + LYR_BATCH.okStt + ' · 失败 ' + LYR_BATCH.failed + ' · 跳过 ' + LYR_BATCH.skipped + (LYR_BATCH.canceled ? ' (已停止)' : ''));
+}
+function lyrBatchStart() {
+  if (LYR_BATCH.running) return { started: false, running: true, total: LYR_BATCH.total };
+  const list = lyrBatchCandidates();
+  if (!list.length) return { started: false, running: false, total: 0 };
+  lyrBatchRun(list);
+  return { started: true, running: true, total: list.length };
+}
+function lyrBatchStop() {
+  if (!LYR_BATCH.running) return false;
+  LYR_BATCH.canceled = true;
+  sttStopping = true;
+  if (sttChild) { try { sttChild.kill(); } catch (e) {} }
+  return true;
 }
 
 // 一次性校准: 截图网易云窗口 → 系统 OCR 读播放条时间 → 返回真实进度(秒)
@@ -1620,7 +2333,7 @@ async function ncmSongCands(title, artist) {
     // 歌名完全相同 > 包含；艺人加分只在完全相同时才生效；时长过短(<60s)多为剪辑版, 降权
     const long = (s.dt || 0) >= 60000;
     const sc = ts + (ts === 4 && am ? 2 : 0) + (long ? 1 : 0);
-    return { song: s, sc, am, artist: ars };
+    return { song: s, sc, am, artist: ars, ts };
   });
   out.sort((a, b) => b.sc - a.sc);
   return out;
@@ -1631,36 +2344,59 @@ async function findNcmSong(title, artist) {
 }
 async function lyricFor(title, artist, durSec) {
   const key = title + '|' + artist;
-  if (LYRIC_CACHE.has(key)) return LYRIC_CACHE.get(key);
+  const hit = LYRIC_CACHE.get(key);
+  if (hit) {
+    if (hit.v && hit.v.ok) {
+      // 内存缓存也要复核: 不能因为"这次存过"就直接信
+      const v = lrcAudit(hit.v.lrc, { durSec, minLines: 3 });
+      if (v.ok) return hit.v;
+      console.log('[歌词] 内存缓存二次校验未通过: ' + title + ' (' + v.reason + ')');
+      LYRIC_CACHE.delete(key);
+    } else if (hit.v && hit.v.ok === false && Date.now() - (hit.at || 0) < 60e3) {
+      return hit.v; // 失败结果只留 60 秒, 避免临时故障被永久记住
+    } else {
+      LYRIC_CACHE.delete(key);
+    }
+  }
   let out = null;
   try {
     const idx = lyrIdxGet(title, artist);
     // 1) 本地已保存歌词: 直接用, 不再联网(网络那份可能是别的版本/会下架/会变)
     if (idx && idx.lrc) {
-      const n = lrcLines(idx.lrc).length;
-      if (n >= 2 && !isJunkLyric(idx.lrc)) {
+      const v = lrcAudit(idx.lrc, { durSec, minLines: 3 });
+      if (v.ok && !idxStale(idx, durSec)) {
         out = {
           ok: true, songId: String(idx.songId || ''), name: idx.name || title,
           artist: idx.artist || artist, durMs: idx.durMs || 0,
-          lrc: idx.lrc, tlrc: idx.tlrc || '', lines: n, fromIndex: true, local: true,
+          lrc: idx.lrc, tlrc: idx.tlrc || '', lines: v.lines, fromIndex: true, local: true,
+          verify: idx.verify || '', source: idx.source || (idx.bvid ? '' : 'netease'),
         };
+        if (v.warn) out.warn = v.warn;
       } else {
+        console.log('[歌词] 索引缓存二次校验未通过: ' + title + ' (' + (v.ok ? '音源时长不匹配' : v.reason) + ')');
         lyrIdxDrop(title, artist);
       }
     }
     // 2) 只有 songId 的老记录: 按 id 取一次, 并把歌词全文回存
     if (!out && idx && idx.songId) {
       const r = await lyricBySongId(idx.songId);
-      const n = lrcLines(r.lrc).length;
-      if (n >= 2 && !isJunkLyric(r.lrc)) {
-        lyrIdxPut(title, artist, { lrc: r.lrc, tlrc: r.tlrc });
-        out = {
-          ok: true, songId: String(idx.songId), name: idx.name || title,
-          artist: idx.artist || artist, durMs: idx.durMs || 0,
-          lrc: r.lrc, tlrc: r.tlrc, lines: n, fromIndex: true,
-        };
+      const v = lrcAudit(r.lrc, { durSec, minLines: 3 });
+      if (v.ok) {
+        const rec = lyrIdxPut(title, artist, {
+          lrc: r.lrc, tlrc: r.tlrc,
+          audioDurMs: durSec > 0 ? Math.round(durSec * 1000) : (idx.audioDurMs || 0),
+        });
+        if (rec) {
+          out = {
+            ok: true, songId: String(idx.songId), name: idx.name || title,
+            artist: idx.artist || artist, durMs: idx.durMs || 0,
+            lrc: r.lrc, tlrc: r.tlrc, lines: v.lines, fromIndex: true,
+            verify: idx.verify || '', source: idx.source || 'netease',
+          };
+          if (v.warn) out.warn = v.warn;
+        }
       } else {
-        lyrIdxDrop(title, artist); // 版本已失效(下架/无版权)
+        lyrIdxDrop(title, artist); // 版本已失效(下架/无版权/脏数据)
       }
     }
     // 3) 完全没有: 搜索候选(按时长优先), 选中后把歌词全文存进索引
@@ -1675,21 +2411,25 @@ async function lyricFor(title, artist, durSec) {
           const j = await ncmReq('/api/song/lyric', { id: song.id, lv: -1, tv: -1, kv: -1 });
           const lrc = ((j || {}).lrc || {}).lyric || '';
           const tlrc = ((j || {}).tlyric || {}).lyric || '';
-          if (!lrc || isJunkLyric(lrc)) continue;
+          const v = lrcAudit(lrc, { durSec, minLines: 3 });
+          if (!v.ok) continue;
           const cand = {
             ok: true, songId: String(song.id), name: song.name || title,
             artist: (song.ar || song.artists || []).map(a => a.name).filter(Boolean).join('/'),
-            durMs: song.dt || 0, lrc, tlrc, lines: lrcLines(lrc).length,
+            durMs: song.dt || 0, lrc, tlrc, lines: v.lines,
           };
+          if (v.warn) cand.warn = v.warn;
           if (!first) first = cand;
           if (cand.lines >= 5) { first = cand; break; }
         }
         out = first || { ok: false, error: '网易云只有纯音乐/伴奏版本, 没有可用歌词' };
         if (out.ok) {
+          out.source = 'netease';
           lyrIdxPut(title, artist, {
             songId: out.songId, name: out.name, artist: out.artist,
             durMs: out.durMs, audioDurMs: durSec > 0 ? Math.round(durSec * 1000) : 0,
             offset: lyrIdxOffset(title, artist), lrc: out.lrc, tlrc: out.tlrc,
+            source: 'netease',
           });
         }
       }
@@ -1697,8 +2437,13 @@ async function lyricFor(title, artist, durSec) {
   } catch (e) {
     out = { ok: false, error: e.message };
   }
+  // 未校对的转写: 播放时明确提示, 避免用户把它当官方歌词
+  if (out && out.ok && out.fromIndex && out.verify === 'none') {
+    const why = out.source === 'whisper' ? '语音转写未校对' : '字幕转写未校对';
+    out.warn = (out.warn ? out.warn + ' · ' : '') + why;
+  }
   if (LYRIC_CACHE.size > 200) LYRIC_CACHE.delete(LYRIC_CACHE.keys().next().value);
-  LYRIC_CACHE.set(key, out);
+  LYRIC_CACHE.set(key, { v: out, at: Date.now() });
   return out;
 }
 
@@ -1718,11 +2463,65 @@ function lrcLines(txt) {
   return out.sort((a, b) => a.t - b.t);
 }
 // 纯音乐/占位歌词不算歌词(网易云常把伴奏/翻唱上传成同名歌曲, 歌词只有一句"纯音乐，请欣赏")
-function isJunkLyric(txt) {
-  const lines = lrcLines(txt);
+const LRC_JUNK_RE = /纯音乐|请欣赏|暂无歌词|无歌词|没有歌词|該歌曲|该歌曲|instrumental|演奏版|伴奏/i;
+function isJunkLyric(txt, parsed) {
+  const lines = parsed || lrcLines(txt);
   if (lines.length < 3) return true;
-  const real = lines.filter(x => !/纯音乐|请欣赏|暂无歌词|无歌词|没有歌词|該歌曲|该歌曲|instrumental|演奏版|伴奏/i.test(x.text));
+  const real = lines.filter(x => !LRC_JUNK_RE.test(x.text));
   return real.length < 3;
+}
+// 元信息型 LRC(Type Beat / 伴奏Demo): 大半行是 BPM、KEY、风格、乐手名, 不是真歌词
+function isMetaLrc(txt, parsed) {
+  const lines = parsed || lrcLines(txt);
+  if (!lines.length) return true;
+  // 大多数行挤在同一秒(通常 00:00): 是歌曲信息/授权文案, 不是逐句歌词
+  const t0 = lines[0].t;
+  const same = lines.filter(x => Math.abs(x.t - t0) < 1.5).length;
+  if (same >= Math.max(3, Math.ceil(lines.length * 0.6))) return true;
+  const meta = /^(BPM|KEY|-?音名|-?调号|-?调式|风格|曲风|时长|作词|作曲|编曲|制作|混音|母带|录音|和声|吉他|贝斯|鼓|弦乐|钢琴|演唱|人声|采样|标签|Beat|Prod|授权)\s*[:：]/i;
+  const bad = lines.filter(x => meta.test(x.text.trim())).length;
+  return bad >= Math.max(2, Math.ceil(lines.length * 0.6));
+}
+// 歌词统一的二次校验: 写入索引、读取缓存、播放展示前都过这一道
+// 只做"能不能信"的硬判断, 时长和音源差太多只给提示, 不直接否决(剪辑片段也能用前段歌词)
+function lrcAudit(txt, opts) {
+  opts = opts || {};
+  const minLines = Math.max(2, Number(opts.minLines) || 3);
+  const lines = opts.lines || lrcLines(txt);
+  if (!lines.length) return { ok: false, reason: '空歌词', lines: 0 };
+  if (lines.length < minLines) return { ok: false, reason: '歌词行数太少(' + lines.length + ')', lines: lines.length };
+  if (isJunkLyric(txt, lines)) return { ok: false, reason: '纯音乐或占位歌词', lines: lines.length };
+  if (isMetaLrc(txt, lines)) return { ok: false, reason: '歌曲信息不是歌词', lines: lines.length };
+  // 时间轴体检: 负数或超过 6 小时基本是解析/脏数据
+  if (lines.some(x => !(Number.isFinite(x.t) && x.t >= 0 && x.t <= 21600))) {
+    return { ok: false, reason: '时间轴异常', lines: lines.length };
+  }
+  // 内容体检: 至少要有对应行数的有效文字, 排除纯符号/乱码行
+  const real = lines.filter(x => /[\p{L}\p{N}]/u.test(x.text)).length;
+  if (real < minLines) return { ok: false, reason: '歌词内容无效', lines: lines.length };
+  const last = lines[lines.length - 1].t;
+  let warn = '';
+  const dur = Number(opts.durSec) || 0;
+  if (dur >= 60) {
+    if (last > dur + Math.max(60, dur * 0.6)) warn = '歌词时长比音源长很多';
+    else if (dur >= 120 && last < dur * 0.35) warn = '歌词可能只覆盖了前段';
+  }
+  return { ok: true, lines: lines.length, last, warn: warn, reason: '' };
+}
+// 索引里的歌词版本和真实音源时长差太多(翻唱/剪辑/别的歌)时判定过期
+function idxStale(idx, durSec) {
+  const ms = Number(durSec) > 0 ? Number(durSec) * 1000 : 0;
+  if (!idx || idx.manual || !ms) return false;
+  const ref = Number(idx.durMs) || Number(idx.audioDurMs) || 0;
+  if (!ref) return false;
+  return Math.abs(ref - ms) > 3000;
+}
+// 歌词实际取自哪个版本: 和当前播放的同名同歌手就不提示, 否则给出「歌名 - 歌手」
+function lyricVersionLabel(idx, title, artist) {
+  if (!idx || !idx.name) return '';
+  const name = String(idx.name), ar = String(idx.artist || '');
+  if (normTitle(name) === normTitle(title) && (!ar || normTitle(ar) === normTitle(artist))) return '';
+  return ar ? name + ' - ' + ar : name;
 }
 
 // 读网易云窗口播放条时间(OCR), 用于把歌词对齐到真实进度
@@ -1750,6 +2549,15 @@ function liveLoad(key, title, artist, durSec) {
   lyricFor(title, artist, durSec).then(j => {
     if (live.key !== key) return;
     if (j && j.ok) {
+      // 展示前最后一道复核: 即使服务端缓存判定通过, 也不把明显异常的数据推给歌词窗
+      const v = lrcAudit(j.lrc, { durSec: Number(durSec) || (Number(j.durMs) || 0) / 1000, minLines: 3 });
+      if (!v.ok) {
+        live.lines = []; live.dur = 0; live.auditWarn = '';
+        live.lyrSrc = ''; live.lyrVerify = '';
+        live.error = '歌词数据异常(' + v.reason + ')';
+        live.loading = false;
+        return;
+      }
       const ls = lrcLines(j.lrc).filter(l => {
         const t = l.text.trim();
         // 过滤封面/翻唱版 LRC 常见的元信息行(词曲编曲等)与“歌名 - 歌手”标题行
@@ -1758,9 +2566,12 @@ function liveLoad(key, title, artist, durSec) {
       });
       live.lines = ls;
       live.dur = (j.durMs || 0) / 1000;
+      live.lyrSrc = j.source || 'netease';
+      live.lyrVerify = j.verify || '';
+      live.auditWarn = [v.warn, j.warn].filter(Boolean).join(' · ');
       live.error = ls.length >= 2 ? '' : '这首歌没有歌词';
     } else {
-      live.lines = []; live.dur = 0;
+      live.lines = []; live.dur = 0; live.lyrSrc = ''; live.lyrVerify = ''; live.auditWarn = '';
       live.error = (j && j.error) || '没找到歌词';
     }
     live.loading = false;
@@ -1778,12 +2589,32 @@ function autoCalibrate(key, src) {
 }
 
 // 有真实播放进度时(InfLink-rs 上报 SMTC timeline), 歌词直接跟随真实位置, 不再靠计时推算
+function pushTrackStillCurrent() {
+  // 暂停时网易云的窗口标题会短暂变空, 这时也要认为推送仍对应当前曲目
+  return !!pushState && (!smState.title || sameTrackKey(pushState.title, pushState.artist, smState.title, smState.artist));
+}
 function smHasPos() {
-  if (pushFresh() && typeof pushState.pos === 'number' && pushState.pos >= 0) return true;
+  if (pushState && typeof pushState.monoPos === 'number' && pushState.monoPos >= 0) {
+    if (pushFresh()) return true;
+    // 暂停后桥接可能停止上报, 但冻结的位置仍然有效, 必须继续用,
+    // 否则会退回"只有窗口标题"的兜底状态, 歌词从第一句重新开始
+    if (pushState.status === 'Paused' && pushTrackStillCurrent()) return true;
+  }
   return smState.src === 'smtc' && typeof smState.pos === 'number' && smState.pos >= 0;
+}
+function sameTrackKey(t1, a1, t2, a2) {
+  return trackKey(t1, a1) === trackKey(t2, a2);
+}
+function trackKey(t, a) {
+  const n = s => String(s || '').replace(/[\s　·•\-—_]/g, '').toLowerCase();
+  return n(t) + '|' + n(a);
 }
 function smLivePos(now) {
   if (pushFresh()) return pushLivePos(now);
+  // 暂停后停止上报: 用最后一次推送冻结的位置, 不能让兜底标题状态把进度归零
+  if (pushState && pushState.status === 'Paused' && pushTrackStillCurrent()) {
+    return pushLivePos(now);
+  }
   const base = Number(smState.pos) || 0;
   if (smState.status === 'Paused') return base;
   return base + Math.max(0, now - (Number(smState.posAt) || now));
@@ -1793,17 +2624,25 @@ function liveTickState() {
   ensureSmWatcher();
   const now = Date.now() / 1000;
   const pushed = pushFresh();
-  const srcState = pushed ? pushState : smState;
+  const smtcReal = smState.src === 'smtc' && typeof smState.pos === 'number' && smState.pos >= 0;
+  // 只剩窗口标题时只能拿到歌名, 既没有进度也判断不了暂停:
+  // 不能把它当成"正在播放", 否则真暂停后歌词会继续往前走, 重启后又从第一句开始
+  // 暂停时窗口标题有时会短暂变空, 这种情况下也必须沿用它之前的推送状态, 不能清空重来
+  const stalePush = !pushed && !smtcReal && pushState
+    && (!smState.title || sameTrackKey(pushState.title, pushState.artist, smState.title, smState.artist));
+  const srcState = pushed ? pushState : (smtcReal ? smState : (stalePush ? pushState : smState));
   const title = srcState.title || '', artist = srcState.artist || '';
-  const pausedNow = srcState.status === 'Paused';
+  const pausedNow = srcState === pushState ? srcState.status === 'Paused' : (smtcReal ? srcState.status === 'Paused' : true);
   if (!title) {
-    live = { key: '', title: '', artist: '', lines: [], dur: 0, anchor: 0, at: now, paused: false, loading: false, error: '', off: 0, warn: '' };
+    live = { key: '', title: '', artist: '', lines: [], dur: 0, anchor: 0, at: now, paused: false, loading: false, error: '', off: 0, warn: '', auditWarn: '', lyrSrc: '', lyrVerify: '' };
     return { ok: true, title: '', playing: false, paused: false, pos: 0, dur: 0, lines: [] };
   }
-  const key = title + '|' + artist;
+  // 用归一化 key 判断是否换歌: 推送里歌名/歌手偶尔带空格或分隔符差异,
+  // 直接字符串比较会误判成换歌, 把进度重置到 0(表现就是暂停后跳回第一句)
+  const key = trackKey(title, artist);
   if (key !== live.key) {
     // 换歌: 偏移直接取索引里记住的值, 不再每次清零重调
-    live = { key, title, artist, lines: [], dur: 0, anchor: 0, at: now, paused: pausedNow, loading: false, error: '', off: lyrIdxOffset(title, artist), rechecked: false, warn: '' };
+    live = { key, title, artist, lines: [], dur: 0, anchor: 0, at: now, paused: pausedNow, loading: false, error: '', off: lyrIdxOffset(title, artist), rechecked: false, warn: '', auditWarn: '', lyrSrc: '', lyrVerify: '' };
     liveLoad(key, title, artist, pushed ? pushState.dur : 0);
     // 换歌自动校准一次: 从 0 开始的计时无法知道前奏/拖进度, 用 OCR 读播放条对齐
     if (!smHasPos()) autoCalibrate(key, smState.src);
@@ -1818,11 +2657,18 @@ function liveTickState() {
     liveLoad(key, title, artist, pushState.dur);
   }
   // 换完还是差得多(live/翻唱版): 明确告诉用户, 不要装作同步
-  live.warn = '';
+  live.warn = live.auditWarn || '';
+  if (!pushed && !smtcReal && !stalePush) {
+    // 连窗口标题都是兜底来源, 没有任何进度信息: 位置只能停在原处, 提示用户校准
+    live.warn = '没连上播放进度，歌词位置可能不准，可点歌词或输入时间校准';
+  }
   if (live.lines.length && live.dur > 0 && pushed && pushState.dur > 0) {
     const dDiff = Math.abs(live.dur - pushState.dur);
-    if (dDiff > 3 && !(lyrIdxGet(title, artist) || {}).manual) {
-      live.warn = '没找到同版本歌词(歌词 ' + Math.round(live.dur) + 's / 音源 ' + Math.round(pushState.dur) + 's, 差 ' + Math.round(dDiff) + 's), 可手动微调';
+    const idx = lyrIdxGet(title, artist) || {};
+    if (dDiff > 3 && !idx.manual) {
+      const ver = lyricVersionLabel(idx, title, artist);
+      live.warn = '没找到同版本歌词(歌词 ' + Math.round(live.dur) + 's / 音源 ' + Math.round(pushState.dur) + 's, 差 ' + Math.round(dDiff) + 's)'
+        + (ver ? ', 这段用「' + ver + '」' : '') + ', 可手动微调';
     }
   }
   if (pausedNow && !live.paused) { live.anchor = live.anchor + (now - live.at); live.paused = true; }
@@ -1835,6 +2681,7 @@ function liveTickState() {
     pos: Math.round(pos * 10) / 10, dur: live.dur || (pushed && pushState.dur > 0 ? pushState.dur : 0),
     audioDur: pushed && pushState.dur > 0 ? pushState.dur : 0,
     lines: live.lines, error: live.lines.length ? '' : live.error, warn: live.warn || '',
+    src: live.lyrSrc || '', verify: live.lyrVerify || '',
   };
 }
 
@@ -1921,6 +2768,18 @@ function closeLyricWindow() {
   return { ok: true, running: false };
 }
 
+// ---------- 本地转写: faster-whisper 离线听整段音频(补时间轴用) ----------
+const ASR_SCRIPT = path.join(DIR, 'asr', 'transcribe.py');
+const ASR_VENV_PY = path.join(DIR, 'asr', '.venv', 'Scripts', 'python.exe');
+const ASR_PY = fs.existsSync(ASR_VENV_PY) ? ASR_VENV_PY : 'python';
+// 本机没有 Python / 模型时, 只是失去本地转写能力, B站字幕与网易云歌词照常可用
+function asrReady() {
+  if (!fs.existsSync(ASR_SCRIPT)) return { ready: false, reason: '缺少转写脚本' };
+  if (!fs.existsSync(ASR_VENV_PY)) return { ready: false, reason: '未安装 Python 环境' };
+  if (!fs.existsSync(path.join(DIR, 'asr', 'models', 'faster-whisper-base'))) return { ready: false, reason: '未下载语音模型' };
+  return { ready: true, reason: '' };
+}
+
 // ---------- 页面 ----------
 const PAGE = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1947,6 +2806,9 @@ const PAGE = `<!DOCTYPE html>
   .seg{display:inline-flex;gap:2px;background:#f1f1f4;border-radius:9px;padding:3px;margin-bottom:14px}
   .seg-btn{height:28px;padding:0 18px;border:none;border-radius:7px;background:transparent;color:var(--t2);font-size:12.5px;cursor:pointer;transition:background .15s,color .15s}
   .seg-btn.on{background:#fff;color:var(--red);font-weight:500;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin:-2px 0 12px}
+  .chip{height:28px;padding:0 12px;border:1px solid var(--line);border-radius:14px;background:#fff;color:var(--t2);font-size:12px;cursor:pointer;transition:border-color .15s,color .15s}
+  .chip:hover{border-color:var(--red);color:var(--red)}
   .account{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--t2)}
   .dot{width:7px;height:7px;border-radius:50%;background:#c9c9cf}
   .dot.on{background:var(--ok)} .dot.off{background:var(--bad)}
@@ -2085,7 +2947,7 @@ const PAGE = `<!DOCTYPE html>
   .compare.split #sres::-webkit-scrollbar-thumb,.compare.split #list::-webkit-scrollbar-thumb{background:#e2e2e8;border-radius:3px}
   .compare.split .sr-head{position:sticky;top:0;z-index:1;background:#fff;padding:6px 0 9px}
   .compare.split .sr,.compare.split .song{padding:13px 0}
-  .compare.split .song{grid-template-columns:1fr 1fr 92px 34px;gap:10px}
+  .compare.split .song{grid-template-columns:1fr 1fr 92px 82px;gap:10px}
   @media (max-width:900px){
     .compare.split{display:block}
     .compare.split > .card{height:auto;min-height:0}
@@ -2095,12 +2957,13 @@ const PAGE = `<!DOCTYPE html>
   .cloud-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px}
   .cloud-right{display:flex;align-items:center;gap:12px}
   .cloud-meta{font-size:12px;color:var(--t3);font-variant-numeric:tabular-nums}
-  .song{display:grid;grid-template-columns:1fr 1fr 108px 40px;grid-template-areas:"name artist meta del";align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line-soft);font-size:13px}
+  .song{display:grid;grid-template-columns:1fr 1fr 108px 88px;grid-template-areas:"name artist meta acts";align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line-soft);font-size:13px}
   .s-name{grid-area:name;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .s-artist{grid-area:artist;min-width:0;color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .s-meta{grid-area:meta;color:var(--t3);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
-  .s-del{grid-area:del;background:none;border:none;font-size:13px;color:var(--t3);cursor:pointer;text-align:right;padding:8px 0}
-  .s-del:hover{color:var(--red)}
+  .s-acts{grid-area:acts;display:flex;align-items:center;justify-content:flex-end;gap:2px}
+  .s-del,.s-fav{background:none;border:none;font-size:13px;color:var(--t3);cursor:pointer;padding:8px 0}
+  .s-del:hover,.s-fav:hover{color:var(--red)}
   .empty{padding:34px 0 30px;text-align:center;color:var(--t3);font-size:13px;border-top:1px solid var(--line-soft)}
   .empty button{background:none;border:none;color:var(--red);font-size:13px;cursor:pointer;padding:8px}
   #sres{margin-top:4px}
@@ -2125,7 +2988,8 @@ const PAGE = `<!DOCTYPE html>
   .listen-sub{font-size:11.5px;color:var(--t3);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .listen-video{margin:10px 0 12px;aspect-ratio:16/9;background:#101012;border-radius:9px;overflow:hidden}
   .listen-video iframe{width:100%;height:100%;border:0;display:block}
-  .listen-acts{display:flex;gap:10px;align-items:center;justify-content:flex-end}
+  .listen-acts{display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
+  .mini-note{font-size:11px;color:var(--t3)}
   #lyricModal{align-items:flex-end;padding:0;background:rgba(24,24,28,.1);backdrop-filter:blur(1.5px);z-index:63}
   .lyr-box{position:relative;height:158px;overflow:hidden;margin:12px 0 6px;mask-image:linear-gradient(180deg,transparent,#000 18%,#000 82%,transparent)}
   .lyr-list{position:absolute;left:0;right:0;top:0;transition:transform .26s ease}
@@ -2165,6 +3029,7 @@ const PAGE = `<!DOCTYPE html>
   .cta-breathe{color:var(--red);font-size:11.5px;font-weight:500;animation:breathe 2.2s ease-in-out infinite}
   @keyframes breathe{0%,100%{opacity:.45}50%{opacity:1}}
   .pick-sub{font-size:12.5px;color:var(--t3);line-height:1.7;margin:4px 0 6px}
+  #favPl{width:100%;height:38px;border:1px solid var(--line);border-radius:8px;padding:0 10px;background:#fff;color:var(--t1);font-size:13px;margin:6px 0 4px}
   .pick-all{border-top:1px solid var(--line-soft);padding:8px 0}
   #pickList{max-height:42vh;overflow:auto;border-top:1px solid var(--line-soft)}
   .pick-row{display:flex;align-items:center;gap:9px;padding:9px 0;border-bottom:1px solid var(--line-soft);font-size:13px;cursor:pointer}
@@ -2192,7 +3057,7 @@ const PAGE = `<!DOCTYPE html>
     .upload input[type=text],.upload textarea{flex:1 1 100%}
     .upload select{flex:1;width:auto}
     .btn{flex:none;padding:0 22px}
-    .song{grid-template-columns:1fr auto;grid-template-areas:"name del" "artist del";row-gap:2px}
+    .song{grid-template-columns:1fr auto;grid-template-areas:"name acts" "artist acts";row-gap:2px}
     .s-meta{display:none}
     .acct-card .crow{flex-wrap:wrap}
     .acct-card input{flex:1 1 100%}
@@ -2209,7 +3074,7 @@ const PAGE = `<!DOCTYPE html>
       <button class="tab" data-tab="up" onclick="switchTab('up')">上传</button>
     </div>
     <div class="top-right">
-      <button class="acct-btn lyr-btn" id="lyrBtn" onclick="toggleLyric()" title="桌面歌词（置顶字幕，跟随网易云播放）" aria-pressed="false"><span class="lyr-ico" aria-hidden="true">♪</span><span class="lyr-label">歌词</span></button>
+      <button class="acct-btn lyr-btn" id="lyrBtn" onclick="toggleLyric()" title="桌面歌词（置顶字幕，跟随网易云播放）" aria-pressed="false"><span class="lyr-ico" aria-hidden="true">♪</span><span class="lyr-label" id="lyrLabel">歌词</span></button>
       <button class="account acct-btn" id="account" onclick="openAccount()" title="账号登录"><span class="dot"></span><span id="acctText">账号</span></button>
       <button class="guide-btn" onclick="openGuide()" title="快速上手"><span class="q">?</span><span class="guide-label">快速上手</span></button>
     </div>
@@ -2246,9 +3111,10 @@ const PAGE = `<!DOCTYPE html>
     <div class="seg" role="tablist" aria-label="上传类型">
       <button class="seg-btn on" data-type="music" onclick="switchType('music')">音乐</button>
       <button class="seg-btn" data-type="pod" onclick="switchType('pod')">播客</button>
+      <button class="seg-btn" data-type="sleep" onclick="switchType('sleep')">助眠</button>
     </div>
     <div class="upload">
-      <textarea id="input" rows="1" placeholder="粘贴 B 站视频/合集页链接或 BV 号，多个用逗号分隔"></textarea>
+      <textarea id="input" rows="1" placeholder="粘贴 B 站视频/合集页链接、音频直链或 BV 号，多个用逗号分隔"></textarea>
       <button class="clip" type="button" onclick="pasteClipboard()" title="从剪贴板识别链接，自动填入并去重">粘贴板</button>
       <button class="btn" id="go" onclick="doUpload()">上传</button>
     </div>
@@ -2257,7 +3123,7 @@ const PAGE = `<!DOCTYPE html>
       <label class="chk" title="去序号/标签, 拆分'歌手-歌名', 歌手字段自动纠正"><input type="checkbox" id="clean" checked>整理歌名</label>
       <button class="link" onclick="toggleMore()" type="button">手动指定歌名</button>
     </div>
-    <p class="hint" id="podHint" hidden>粘贴小宇宙播客单集链接（xiaoyuzhoufm.com/episode/…），多个用逗号分隔；超过 200MB 时会先询问是否拆分成多个文件。</p>
+    <p class="hint" id="podHint" hidden>粘贴苹果播客单集链接（podcasts.apple.com/…?i=…），小宇宙单集链接仍可用；超过 200MB 时会先询问是否拆分成多个文件。</p>
     <div class="more" id="more">
       <input type="text" id="song" placeholder="歌名 (留空=自动)">
       <input type="text" id="artist" placeholder="歌手 (留空=自动)">
@@ -2287,6 +3153,14 @@ const PAGE = `<!DOCTYPE html>
         <input type="text" id="skw" placeholder="搜索 B 站歌曲/翻唱/演唱会…">
         <button class="btn" id="sbtn" onclick="doSearch()">搜索</button>
       </div>
+      <div class="chips" id="sleepChips" hidden>
+        <button class="chip" data-kw="雨声">雨声</button>
+        <button class="chip" data-kw="白噪音">白噪音</button>
+        <button class="chip" data-kw="篝火">篝火</button>
+        <button class="chip" data-kw="ASMR">ASMR</button>
+        <button class="chip" data-kw="冥想">冥想</button>
+        <button class="chip" data-kw="轻音乐">轻音乐</button>
+      </div>
       <div id="sres" hidden></div>
       <div class="search-empty" id="searchHint">输入歌名后点「搜索」，结果会显示在这里，可与右侧云盘对照</div>
     </section>
@@ -2307,6 +3181,8 @@ const PAGE = `<!DOCTYPE html>
     <summary>上传历史 (本地记录, 最近50条) <button class="link" onclick="event.preventDefault();event.stopPropagation();clearHistory()">清空</button></summary>
     <div id="history"></div>
   </details>
+
+  <div id="lyrBatchLine" style="display:none;margin:12px 2px 0;font-size:12px;line-height:1.75;opacity:.85"></div>
 
   <p class="foot">免责声明: 上传内容仅限本人收听, 请遵守B站与网易云音乐的服务条款及版权法规, 请勿用于商业用途。</p>
 </main>
@@ -2367,9 +3243,9 @@ const PAGE = `<!DOCTYPE html>
     </div>
     <div id="guideUp" hidden>
       <div class="guide-step"><span class="guide-num">1</span><span>右上角「账号」里分别扫码登录网易云和 B 站：网易云用来接收云盘，B 站用来读取音源。</span></div>
-      <div class="guide-step"><span class="guide-num">2</span><span>顶部「上传」里切换「音乐」或「播客」。</span></div>
-      <div class="guide-step"><span class="guide-num">3</span><span>音乐：粘贴 B 站视频/合集链接或 BV 号，可一次粘贴多个；播客：粘贴小宇宙单集链接，可一次粘贴多期。</span></div>
-      <div class="guide-step"><span class="guide-num">4</span><span>点「上传」后，进度和结果会显示在下方；完成后可在「音乐云盘」和上传记录里查看。</span></div>
+      <div class="guide-step"><span class="guide-num">2</span><span>顶部「上传」里切换「音乐」「播客」或「助眠」。</span></div>
+      <div class="guide-step"><span class="guide-num">3</span><span>音乐：粘贴 B 站视频/合集链接、BV 号或音频直链；播客：搜索苹果播客并选单集，也可粘贴苹果/小宇宙单集链接；助眠：点关键词搜索，或粘贴助眠音频直链。</span></div>
+      <div class="guide-step"><span class="guide-num">4</span><span>点「上传」后，进度和结果会显示在下方；完成后可在「音乐云盘」和上传记录里查看，点云盘歌曲右侧「收藏」可放进任意自建歌单。</span></div>
       <div class="guide-tip">单个文件超过 200MB 时会询问是否拆分上传，拆分后文件名会自动带（序号/总段数）。</div>
     </div>
     <div class="split-act" style="margin-top:14px"><button class="btn" onclick="closeGuide()">知道了</button></div>
@@ -2411,13 +3287,23 @@ const PAGE = `<!DOCTYPE html>
     <input type="range" class="lyr-seek" id="lyrSeek" min="0" max="100" step="0.5" value="0"
            oninput="seekLyric(this.value)" aria-label="校准进度">
     <div id="lyrCands" style="display:none;margin:8px 0 0;max-height:230px;overflow:auto;border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:6px 8px;font-size:12px;line-height:1.6"></div>
+    <div id="sttBox" style="display:none;margin:8px 0 0;border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.7">
+      <div id="sttBody" style="max-height:200px;overflow:auto"></div>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+        <button class="mini primary" id="sttGo" onclick="sttStart()">开始补时间轴</button>
+        <button class="mini" id="sttUndo" onclick="sttUndo()" style="display:none">清除本机歌词</button>
+        <button class="mini" id="sttCancel" onclick="sttCancel()">取消</button>
+      </div>
+    </div>
     <div class="listen-acts">
       <button class="mini" onclick="nudgeLyric(-1)">−1 秒</button>
       <button class="mini" onclick="nudgeLyric(1)">+1 秒</button>
       <button class="mini" onclick="calibrateLyric(this)">校准</button>
       <button class="mini" onclick="recalibrate()">从头对齐</button>
       <button class="mini" onclick="openCands()">换歌词版本</button>
+      <button class="mini" id="sttBtn" onclick="openSttPanel()" title="没有时间轴歌词时，用本地 whisper 听一遍这段音频，自动补上时间戳">补时间轴</button>
       <button class="mini" onclick="ncmDirect(this)" title="不用插件: 以调试端口重启网易云后直接读进度">调试直连</button>
+      <span class="mini-note" id="ncmSt" title="检查网易云进程的命令行是否带 --remote-debugging-port"></span>
       <button class="mini" id="brBtn" onclick="installBridge(this)" title="安装网易云桥接插件, 拿到真实进度">桥接插件</button>
       <button class="mini" onclick="closeLyric()">关闭</button>
     </div>
@@ -2437,6 +3323,18 @@ const PAGE = `<!DOCTYPE html>
   </div>
 </div>
 
+<div class="acct-modal" id="favModal" hidden>
+  <div class="acct-card" role="dialog" aria-label="收藏到歌单">
+    <div class="acct-head"><span id="favTitle">收藏到歌单</span><button class="mini" onclick="closeFav()">关闭</button></div>
+    <p class="pick-sub" id="favSub">选择要收藏到的歌单，默认「我喜欢的音乐」。</p>
+    <select id="favPl" aria-label="选择歌单"></select>
+    <div class="split-act" style="margin-top:14px">
+      <button class="mini" onclick="closeFav()">取消</button>
+      <button class="mini primary" id="favYes" onclick="confirmFav()">收藏</button>
+    </div>
+  </div>
+</div>
+
 <div class="bp" id="biliPanel" hidden>
   <div class="bp-bar">
     <span class="bp-t" id="bpTitle">B站搜索</span>
@@ -2449,14 +3347,14 @@ const PAGE = `<!DOCTYPE html>
 <script>
 function esc(s){ return String(s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 const $ = id => document.getElementById(id);
-function lockScroll(){ document.body.style.overflow = (!$('biliPanel').hidden || !$('accountModal').hidden || !$('splitModal').hidden || !$('pickModal').hidden || !$('guideModal').hidden || !$('listenModal').hidden || !$('srcModal').hidden || !$('lyricModal').hidden) ? 'hidden' : ''; }
+function lockScroll(){ document.body.style.overflow = (!$('biliPanel').hidden || !$('accountModal').hidden || !$('splitModal').hidden || !$('pickModal').hidden || !$('favModal').hidden || !$('guideModal').hidden || !$('listenModal').hidden || !$('srcModal').hidden || !$('lyricModal').hidden) ? 'hidden' : ''; }
 function openAccount(){ $('accountModal').hidden = false; lockScroll(); }
 function closeAccount(){ $('accountModal').hidden = true; lockScroll(); }
 function toggleManual(){ $('manualBox').hidden = !$('manualBox').hidden; }
 function toggleMore(){ $('more').classList.toggle('open'); }
 function focusInput(){ $('input').focus(); }
 
-// 导航两级: 一级 补歌/上传; 上传下二级 音乐/播客. 进度与历史共用
+// 导航两级: 一级 补歌/上传; 上传下二级 音乐/播客/助眠. 进度与历史共用
 let curTab = 'fix', curType = 'music';
 function switchTab(t) {
   const next = t === 'up' ? 'up' : 'fix';
@@ -2468,27 +3366,46 @@ function switchTab(t) {
   $('fixCard').hidden = !fix;
   $('fixSide').hidden = !fix;
   $('uploadCard').hidden = fix;
-  $('searchCard').hidden = fix || curType === 'pod';
+  $('searchCard').hidden = fix;
   $('compare').hidden = fix;
   if (fix) { setSplit(false); loadPlaylists(); loadSide(); }
   else applyType();
   if (changed) window.scrollTo(0, 0);
 }
 function switchType(t) {
-  curType = t === 'pod' ? 'pod' : 'music';
+  curType = (t === 'pod' || t === 'sleep') ? t : 'music';
   try { localStorage.setItem('bili2ncm.type', curType); } catch (e) {}
   document.querySelectorAll('.seg-btn').forEach(b => b.classList.toggle('on', b.dataset.type === curType));
+  resetSearchState();
   if (curTab === 'up') applyType();
 }
+function resetSearchState() {
+  searchItems = []; searchMode = ''; appleShows = []; appleEps = []; appleShowName = '';
+  $('sres').hidden = true; $('sres').innerHTML = '';
+  $('searchHint').hidden = false;
+}
 function applyType() {
-  const pod = curType === 'pod';
-  $('input').placeholder = pod
-    ? '粘贴小宇宙播客单集链接（xiaoyuzhoufm.com/episode/…），多个用逗号分隔'
-    : '粘贴 B 站视频/合集页链接或 BV 号，多个用逗号分隔';
-  $('seasonWrap').hidden = pod;
-  $('podHint').hidden = !pod;
-  $('searchCard').hidden = pod;
-  setSplit(!pod);
+  const t = curType;
+  $('input').placeholder = t === 'pod'
+    ? '粘贴苹果播客单集链接（或小宇宙单集链接），多个用逗号分隔'
+    : t === 'sleep'
+      ? '粘贴助眠音频直链（mp3/m4a），或搜索助眠节目'
+      : '粘贴 B 站视频/合集页链接、音频直链或 BV 号，多个用逗号分隔';
+  $('seasonWrap').hidden = t !== 'music';
+  $('podHint').hidden = t === 'music';
+  $('podHint').textContent = t === 'sleep'
+    ? '可粘贴音频直链（.mp3/.m4a 等），或点上方关键词搜索助眠节目；超过 200MB 会先询问是否拆分成多个文件。'
+    : '粘贴苹果播客单集链接（podcasts.apple.com/…?i=…），小宇宙单集链接仍可用；超过 200MB 会先询问是否拆分成多个文件。';
+  $('sleepChips').hidden = t !== 'sleep';
+  $('skw').placeholder = t === 'pod'
+    ? '搜索苹果播客节目，如：故事FM、忽左忽右…'
+    : t === 'sleep'
+      ? '搜索助眠节目，如：雨声、白噪音、ASMR…'
+      : '搜索 B 站歌曲/翻唱/演唱会…';
+  $('searchHint').textContent = t === 'music'
+    ? '输入歌名后点「搜索」，结果会显示在这里，可与右侧云盘对照'
+    : '搜索节目后点「看单集」，再选具体单集上传；右侧可对照云盘已有歌曲';
+  setSplit(true);
 }
 
 // 超过 200MB: 询问是否拆分成多个文件上传
@@ -2678,22 +3595,70 @@ async function loadList() {
     $('stats').textContent = '共 ' + j.count + ' 首 · ' + fmtSize(j.size) + (j.maxSize ? ' / 容量 ' + fmtSize(j.maxSize) : '');
     if (j.error) { box.innerHTML = '<div class="empty">' + esc(j.error) + '<br><button onclick="loadList()">重试</button></div>'; return; }
     cloudSongs = j.songs || []; cloudLoaded = true;
-    if (searchItems.length) refreshSearchDup();
+    if (searchMode) refreshSearchDup();
     if (!j.songs.length) { box.innerHTML = '<div class="empty">云盘还是空的<br><button onclick="focusInput()">去上传第一首</button></div>'; return; }
     box.innerHTML = j.songs.map(s =>
       '<div class="song"><div class="s-name">' + esc(s.name) + '</div><div class="s-artist">' + esc(s.artist) + '</div>'
       + '<div class="s-meta">' + (s.bitrate ? Math.round(s.bitrate/1000)+'kbps' : '-') + ' · ' + (s.size ? (s.size/1048576).toFixed(1)+'MB' : '-') + '</div>'
-      + '<button class="s-del" data-id="' + s.songId + '" data-name="' + esc(s.name) + '">删除</button></div>').join('');
+      + '<div class="s-acts"><button class="s-fav" data-id="' + s.songId + '" data-name="' + esc(s.name) + '">收藏</button>'
+      + '<button class="s-del" data-id="' + s.songId + '" data-name="' + esc(s.name) + '">删除</button></div></div>').join('');
   } catch (e) {
     box.innerHTML = '<div class="empty">加载失败<button onclick="loadList()">重试</button></div>';
   }
 }
 $('list').addEventListener('click', e => {
+  const fav = e.target.closest('.s-fav');
+  if (fav) { openFav({ songId: Number(fav.dataset.id), name: fav.dataset.name }); return; }
   const b = e.target.closest('.s-del'); if (!b) return;
   if (!confirm('确定从云盘删除《' + b.dataset.name + '》?')) return;
   fetch('/api/del', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({songId:+b.dataset.id}) }).then(loadList);
 });
-// 多链接输入: Enter 提交(Shift+Enter 换行)
+// 云盘歌曲收藏到指定歌单(默认「我喜欢的音乐」)
+let favSong = null, plCache = null;
+async function getPlaylistCache() {
+  if (plCache) return plCache;
+  const j = await (await fetch('/api/playlists')).json();
+  if (j.error) throw new Error(j.error || '歌单读取失败');
+  plCache = j.playlists || [];
+  return plCache;
+}
+async function openFav(song) {
+  favSong = song;
+  $('favTitle').textContent = '收藏《' + song.name + '》到歌单';
+  $('favPl').innerHTML = '<option>读取歌单中…</option>';
+  $('favModal').hidden = false;
+  lockScroll();
+  try {
+    const list = await getPlaylistCache();
+    const own = list.filter(p => p.own || p.special);
+    if (!own.length) throw new Error('还没有可收藏的自己创建的歌单');
+    $('favPl').innerHTML = own.map(p =>
+      '<option value="' + p.id + '"' + (p.special ? ' selected' : '') + '>' + esc(p.name) + '（' + p.count + ' 首）</option>').join('');
+  } catch (e) {
+    $('favPl').innerHTML = '<option value="">' + esc(e.message) + '</option>';
+  }
+}
+function closeFav() { $('favModal').hidden = true; favSong = null; lockScroll(); }
+async function confirmFav() {
+  if (!favSong) return;
+  const pid = Number($('favPl').value);
+  if (!pid) { toast('请先选择歌单'); return; }
+  const btn = $('favYes');
+  btn.disabled = true; btn.textContent = '收藏中';
+  try {
+    const j = await (await fetch('/api/playlist/tracks', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ op: 'add', pid, ids: [favSong.songId] }),
+    })).json();
+    if (!j.ok) throw new Error(j.error || '收藏失败');
+    const hit = (plCache || []).find(p => String(p.id) === String(pid));
+    toast('已收藏到「' + (hit ? hit.name : '歌单') + '」');
+    closeFav();
+  } catch (e) {
+    alert('收藏失败: ' + e.message);
+  }
+  btn.disabled = false; btn.textContent = '收藏';
+}
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doUpload(); } });
 function uploadBV(bvid) { $('input').value = bvid; doUpload(); }
 
@@ -2857,6 +3822,7 @@ async function toggleLyric(){
       return;
     }
     const r = await (await fetch('/api/lyric-window', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'open' }) })).json();
+    startLyricBatch();
     if (!r.ok) { toast(r.error || '桌面歌词启动失败'); openLyric(); return; }
     if (r.installing) { setLyrBtn(true); startLyrWinPoll(); toast('首次使用，正在安装桌面歌词组件（约 20 秒），装好会自动打开'); return; }
     setLyrBtn(true); startLyrWinPoll(); toast('桌面歌词已开启，可拖动浮窗到任意位置');
@@ -2880,10 +3846,68 @@ function startLyrWinPoll(){
   }, 3000);
 }
 function stopLyrWinPoll(){ if (lyrWinPoll) { clearInterval(lyrWinPoll); lyrWinPoll = null; } }
+// 点「歌词」打开桌面窗时, 后台自动把上传历史里缺歌词的歌批量补上
+// 先联网, 找不到再用本地 whisper; 进度显示在导航按钮和歌词抽屉里
+let batchPoll = null, batchWasRunning = false, batchSeenSaved = '';
+function startLyricBatch(){
+  fetch('/api/lyric/batch/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(r => r.json())
+    .then(j => {
+      if (j.started) toast('后台开始补 ' + j.total + ' 首缺歌词的歌');
+      if (j.running) startBatchPoll();
+    })
+    .catch(() => {});
+}
+function startBatchPoll(){
+  if (batchPoll) return;
+  batchPoll = setInterval(batchTick, 4000);
+  batchTick();
+}
+// 页面打开就接管后台补歌词进度: 哪怕任务是在别处/上次打开的, 这里也实时显示
+startBatchPoll();
+async function batchTick(){
+  try {
+    const j = await (await fetch('/api/lyric/batch')).json();
+    const lbl = $('lyrLabel');
+    if (lbl) lbl.textContent = j.running ? '补歌词 ' + j.done + '/' + j.total : '歌词';
+    const line = $('lyrBatchLine');
+    if (line) {
+      if (j.running) {
+        line.style.display = 'block';
+        line.innerHTML = '批量补歌词 ' + j.done + '/' + j.total
+          + (j.current ? ' · 当前 ' + esc(j.current) : '')
+          + '（B站字幕 ' + j.bili + ' / 网易云 ' + j.online + ' / 本地 ' + j.stt + ' / 失败 ' + j.failed + '）'
+          + (j.asrReady === false ? ' · 本地转写不可用（' + esc(j.asrReason || '未安装 Python') + '）' : '')
+          + ' <button class="mini" onclick="stopLyricBatch()">停止</button>';
+      } else if (j.total) {
+        line.style.display = 'block';
+        line.textContent = '上次批量补歌词：共 ' + j.total + ' 首，B站字幕 ' + j.bili + '，网易云 ' + j.online + '，本地 ' + j.stt + '，失败 ' + j.failed + '，跳过 ' + j.skipped
+          + (j.asrReady === false ? '（本地转写未启用：' + (j.asrReason || '未安装 Python') + '）' : '');
+      } else {
+        line.style.display = 'block';
+        line.textContent = '后台补歌词：暂无待补任务';
+      }
+    }
+    // 批量刚好补到正在播放这首: 立刻重新加载, 不用等切歌
+    if (j.lastSaved && j.lastSaved !== batchSeenSaved && j.lastSaved === lyrKey && !lyrLines.length && lyrSong.title) {
+      batchSeenSaved = j.lastSaved;
+      await loadLyric(lyrSong.title, lyrSong.artist, lyrAudioDur);
+    }
+    if (batchWasRunning && !j.running) toast('批量补歌词完成：B站字幕 ' + j.bili + ' · 网易云 ' + j.online + ' · 本地 ' + j.stt + ' · 失败 ' + j.failed);
+    batchWasRunning = !!j.running;
+    if (!j.running && (j.finishedAt || !j.total) && batchPoll) { clearInterval(batchPoll); batchPoll = null; }
+  } catch (e) {}
+}
+async function stopLyricBatch(){
+  try {
+    await fetch('/api/lyric/batch/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    toast('正在停止批量补歌词');
+  } catch (e) {}
+}
 function openLyric(){
   $('lyricModal').hidden = false;
   $('lyrBtn').classList.add('on'); $('lyrBtn').setAttribute('aria-pressed', 'true');
-  lockScroll(); startLyricLoop();
+  lockScroll(); startLyricLoop(); refreshNcmStatus();
 }
 function closeLyric(){
   closeCands();
@@ -2937,6 +3961,96 @@ async function pickCand(i){
     await loadLyric(lyrSong.title, lyrSong.artist, lyrAudioDur);
   } catch (e) { b.innerHTML = '保存失败'; }
 }
+// 「补时间轴」先展开说明卡(利/弊/当前状态), 由用户看过后再点开始, 不使用网页弹窗
+function openSttPanel(){
+  const t = lyrSong.title, a = lyrSong.artist;
+  const body = $('sttBody'), go = $('sttGo');
+  $('sttBox').style.display = 'block';
+  $('sttUndo').style.display = 'none';
+  const cancel = $('sttCancel');
+  cancel.disabled = false; cancel.textContent = '取消';
+  sttRunning = false;
+  closeCands();
+  if (!t) {
+    go.disabled = true;
+    body.innerHTML = '<div>现在没识别到正在播放的歌。先在网易云播放要补时间轴的那一首，再点这个按钮。</div>';
+    return;
+  }
+  go.disabled = false;
+  go.textContent = '开始补时间轴';
+  const has = lyrLines.length;
+  body.innerHTML =
+    '<div style="font-weight:600;margin-bottom:4px">补时间轴：' + esc(t) + (a ? ' · ' + esc(a) : '') + '</div>' +
+    '<div>用这首歌上传时的 B站音源，在<b>本机</b>用 whisper 重新听一遍，生成带时间戳的歌词。</div>' +
+    '<div style="margin-top:6px;opacity:.9">好处</div>' +
+    '<div>· 原本没有歌词、或歌词没有时间轴的歌，也能逐句滚动；<br>· 声音只在本机处理，不联网、不上传；<br>· 不改动云盘里已上传的音频。</div>' +
+    '<div style="margin-top:6px;opacity:.9">代价</div>' +
+    '<div>· 机器听写会有错字、漏句甚至串句，歌词文字只能当参考，结果会标「未校对」；<br>· 一首歌大约 1-2 分钟，期间请别关页面；<br>· 只能补「用本工具上传过、且上传历史里还有记录」的歌；<br>· 会替换当前' + (has ? '这 ' + has + ' 句歌词' : '歌词') + '，不想要可以再点「清除本机歌词」恢复联网歌词。</div>';
+}
+function closeStt(){ const b = $('sttBox'); if (b) b.style.display = 'none'; }
+let sttRunning = false;
+async function sttCancel(){
+  // 识别中点「取消」= 真正停止后端进程; 空闲时只是收起面板
+  if (!sttRunning) { closeStt(); return; }
+  $('sttCancel').disabled = true;
+  try {
+    await fetch('/api/lyric/stt/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  } catch (e) {}
+}
+async function sttStart(){
+  const t = lyrSong.title, a = lyrSong.artist;
+  if (!t) return;
+  const body = $('sttBody'), go = $('sttGo'), undo = $('sttUndo'), cancel = $('sttCancel');
+  const log = [];
+  const paint = () => { body.innerHTML = log.map(x => '<div>' + esc(x) + '</div>').join(''); body.scrollTop = body.scrollHeight; };
+  const push = m => { log.push(m); paint(); };
+  undo.style.display = 'none';
+  go.disabled = true; go.textContent = '识别中…';
+  sttRunning = true; cancel.disabled = false; cancel.textContent = '停止';
+  body.innerHTML = ''; push('准备开始…');
+  let saved = false;
+  try {
+    const res = await fetch('/api/lyric/stt', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: t, artist: a }),
+    });
+    await readUploadStream(res, j => {
+      if (j.type === 'log') push(j.msg || '');
+      else if (j.type === 'canceled') push('已停止，本次结果没有保存');
+      else if (j.type === 'error') push('✗ ' + (j.msg || '补时间轴失败'));
+      else if (j.type === 'done') { push('✓ 已写入 ' + j.lines + ' 句（语音转写，未校对）'); saved = true; }
+    });
+    if (saved) {
+      await loadLyric(t, a, lyrAudioDur);
+      undo.style.display = '';
+      go.textContent = '再补一次';
+    }
+  } catch (e) {
+    push('✗ ' + (e && e.message ? e.message : '请求失败'));
+  }
+  sttRunning = false;
+  cancel.disabled = false; cancel.textContent = '取消';
+  go.disabled = false;
+  if (go.textContent === '识别中…') go.textContent = '开始补时间轴';
+}
+async function sttUndo(){
+  const t = lyrSong.title, a = lyrSong.artist;
+  if (!t) return;
+  const body = $('sttBody'), undo = $('sttUndo');
+  body.innerHTML = '<div>正在清除本机歌词…</div>';
+  try {
+    const r = await (await fetch('/api/lyric/drop', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: t, artist: a }),
+    })).json();
+    if (!r.ok) throw new Error(r.error || '清除失败');
+    undo.style.display = 'none';
+    await loadLyric(t, a, lyrAudioDur);
+    body.innerHTML = '<div>已清除本机歌词，正在使用联网歌词（没有就显示没找到）。</div>';
+  } catch (e) {
+    body.innerHTML = '<div>✗ ' + esc(e && e.message ? e.message : '清除失败') + '</div>';
+  }
+}
 async function ncmDirect(btn){
   const old = btn.textContent;
   btn.disabled = true; btn.textContent = '重启中…';
@@ -2945,6 +4059,22 @@ async function ncmDirect(btn){
     if (!j.ok) alert(j.error || '直连失败');
   } catch (e) { alert('直连失败'); }
   btn.disabled = false; btn.textContent = old;
+  refreshNcmStatus();
+}
+// 检查网易云这次启动是否带调试参数(决定 CDP 直连能不能用)
+async function refreshNcmStatus(){
+  const el = $('ncmSt'); if (!el) return;
+  try {
+    const j = await (await fetch('/api/ncm/status')).json();
+    if (!j.ncmRunning) { el.textContent = '网易云未运行'; el.style.color = ''; return; }
+    if (j.launchedWithPort) {
+      el.textContent = '已带调试端口' + (j.injected ? ' · 已注入' : ' · 未注入');
+      el.style.color = j.injected ? '#2f9e44' : '#e8590c';
+    } else {
+      el.textContent = '未带调试端口';
+      el.style.color = '#e8590c';
+    }
+  } catch (e) { el.textContent = ''; }
 }
 async function installBridge(btn){
   const old = btn.textContent;
@@ -3045,8 +4175,15 @@ async function loadLyric(title, artist, audioDur){
       return;
     }
     lyrLines = parseLrc(j.lrc);
+    // 前端二次校验: 行数过少或时间轴异常时不展示, 避免把脏缓存当正常歌词
+    if (lyrLines.length < 2 || lyrLines.some(l => l.t < 0 || l.t > 21600)) {
+      lyrLines = []; lyrDur = 0;
+      $('lyrSub').textContent = (artist ? artist + ' · ' : '') + '歌词数据异常，试试换一个版本';
+      $('lyrBox').innerHTML = '<div class="lyr-empty">歌词数据异常，试试换一个版本</div>';
+      return;
+    }
     lyrDur = j.durMs ? j.durMs / 1000 : (lyrLines.length ? lyrLines[lyrLines.length - 1].t + 8 : 0);
-    $('lyrSub').textContent = (artist ? artist + ' · ' : '') + lyrLines.length + ' 句歌词';
+    $('lyrSub').textContent = (artist ? artist + ' · ' : '') + lyrLines.length + ' 句歌词' + (j.warn ? ' · ' + j.warn : '');
     $('lyrSeek').max = String(Math.max(1, Math.round(lyrDur)));
     $('lyrDur').textContent = fmtLyr(lyrDur);
     renderLines();
@@ -3085,9 +4222,14 @@ function anchorLine(i){
   renderLyric();
 }
 function seekLyric(v){
-  lyrOff = (Number(v) || 0) - lyrSrvPos;
-  setAnchor(lyrSrvPos + lyrOff);
+  const sec = Math.max(0, Number(v) || 0);
+  // 抽屉拖进度条: 直接推给服务端, 桌面歌词窗也跟着对齐
+  lyrOff = 0; lyrSrvPos = sec;
+  setAnchor(sec);
   renderLyric();
+  if (lyrKey) {
+    fetch('/api/live',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seek:sec})}).catch(function(){});
+  }
 }
 function nudgeLyric(d){
   lyrOff += d;
@@ -3331,8 +4473,8 @@ $('srcModal').addEventListener('click', e => {
   else if (act === 'qr') { closeSrc(); showQr('bili'); }
   else if (act === 'pop') { closeSrc(); popSearch(b.dataset.kw); }
 });
-// B站搜索: 结果与云盘曲目对照, 已收录的标出来
-let searchItems = [];
+// 搜索结果: 音乐=B站视频, 播客/助眠=苹果播客节目与单集
+let searchItems = [], searchMode = '', appleShows = [], appleEps = [], appleShowName = '';
 function normName(s){
   let out = '';
   for (const ch of String(s || '').toLowerCase()) {
@@ -3354,10 +4496,15 @@ function cloudMatch(title) {
   }) || null;
 }
 function refreshSearchDup() {
-  searchItems.forEach(v => { v.cloud = !!cloudMatch(v.title); });
+  if (searchMode === 'ep') {
+    appleEps = appleEps.map(v => Object.assign({}, v, { cloud: !!cloudMatch(v.name) }));
+  } else if (searchMode === 'bili') {
+    searchItems = searchItems.map(v => Object.assign({}, v, { cloud: !!cloudMatch(v.title) }));
+  }
   renderSearch();
 }
 function renderSearch() {
+  if (searchMode === 'show' || searchMode === 'ep') return searchMode === 'show' ? renderShows() : renderEps();
   const box = $('sres');
   const total = searchItems.length;
   const dup = searchItems.filter(v => v.cloud).length;
@@ -3379,12 +4526,41 @@ function renderSearch() {
     + '</div></div>'
   ).join('');
 }
+function renderShows() {
+  const box = $('sres');
+  setSplit(true);
+  const head = '<div class="sr-head"><span>找到 ' + appleShows.length + ' 个节目</span></div>';
+  if (!appleShows.length) { box.innerHTML = head + '<div class="empty">没有找到相关节目，换个关键词试试</div>'; return; }
+  box.innerHTML = head + appleShows.map(s =>
+    '<div class="sr"><div class="sr-l"><div class="sr-t">' + esc(s.name) + '</div>'
+    + '<div class="sr-m">' + esc(s.artist || '未知主播') + (s.count ? ' · ' + s.count + ' 集' : '') + '</div></div>'
+    + '<div class="sr-a"><button class="mini primary" data-act="show" data-id="' + esc(s.collectionId) + '" data-name="' + esc(s.name) + '">看单集</button></div></div>'
+  ).join('');
+}
+function renderEps() {
+  const box = $('sres');
+  setSplit(true);
+  const head = '<div class="sr-head"><span>' + esc(appleShowName || '节目') + ' · ' + appleEps.length + ' 集</span>'
+    + '<div class="sr-btns"><button class="mini" data-act="backshow">返回节目</button></div></div>';
+  if (!appleEps.length) { box.innerHTML = head + '<div class="empty">这个节目暂时没有公开音频的单集</div>'; return; }
+  box.innerHTML = head + appleEps.map(v =>
+    '<div class="sr"><div class="sr-l"><div class="sr-t">' + esc(v.name) + (v.cloud ? '<span class="badge">云盘已有</span>' : '') + '</div>'
+    + '<div class="sr-m">' + esc(v.show) + (v.durationMs ? ' · ' + fmtDur(v.durationMs) : '') + '</div></div>'
+    + '<div class="sr-a"><button class="mini' + (v.cloud ? '' : ' primary') + '" data-act="epup" data-link="' + esc(v.link) + '">'
+    + (v.cloud ? '仍要上传' : '上传') + '</button></div></div>'
+  ).join('');
+}
 async function doSearch() {
+  if (curType === 'music') return doBiliSearch();
+  return doAppleSearch($('skw').value.trim());
+}
+async function doBiliSearch() {
   const kw = $('skw').value.trim();
   if (!kw) { $('skw').focus(); return; }
   const box = $('sres');
   box.hidden = false;
   $('searchHint').hidden = true;
+  searchMode = 'bili';
   if (!biliLogged) { showBiliLoginPrompt(box); return; }
   box.innerHTML = '<div class="empty">搜索中...</div>';
   try {
@@ -3399,8 +4575,45 @@ async function doSearch() {
     box.innerHTML = '<div class="empty">搜索失败, 请稍后再试 <button class="mini" data-act="pop">在页面内搜B站</button></div>';
   }
 }
+async function doAppleSearch(kw) {
+  if (!kw) { $('skw').focus(); return; }
+  const box = $('sres');
+  box.hidden = false;
+  $('searchHint').hidden = true;
+  searchMode = 'show';
+  box.innerHTML = '<div class="empty">搜索中...</div>';
+  try {
+    if (!cloudLoaded) await loadList();
+    const j = await (await fetch('/api/podcast/search?kw=' + encodeURIComponent(kw))).json();
+    if (j.error) { appleShows = []; box.innerHTML = '<div class="empty">' + esc(j.error) + '</div>'; return; }
+    appleShows = j.items || [];
+    renderShows();
+  } catch (e) {
+    appleShows = [];
+    box.innerHTML = '<div class="empty">搜索失败, 请稍后再试</div>';
+  }
+}
+async function openAppleShow(id, name) {
+  const box = $('sres');
+  box.hidden = false;
+  $('searchHint').hidden = true;
+  appleShowName = name;
+  searchMode = 'ep';
+  box.innerHTML = '<div class="empty">正在读取单集...</div>';
+  try {
+    if (!cloudLoaded) await loadList();
+    const j = await (await fetch('/api/podcast/episodes?id=' + encodeURIComponent(id))).json();
+    if (j.error) throw new Error(j.error);
+    appleEps = (j.items || []).map(v => Object.assign({}, v, { cloud: !!cloudMatch(v.name) }));
+    renderEps();
+  } catch (e) {
+    appleEps = [];
+    box.innerHTML = '<div class="empty">' + esc(e.message || '单集读取失败') + '<br><button class="mini" data-act="backshow">返回节目</button></div>';
+  }
+}
 function showBiliLoginPrompt(box) {
   searchItems = [];
+  searchMode = 'bili';
   $('searchHint').hidden = true;
   setSplit(true);
   box.innerHTML = '<div class="empty">搜索需要先登录B站<br><button class="mini" data-act="qr">扫码登录B站</button> <button class="mini" data-act="pop">在页面内搜B站</button></div>';
@@ -3411,8 +4624,16 @@ $('sres').addEventListener('click', e => {
   const act = b.dataset.act;
   if (act === 'preview') openListen(b.dataset.bv, '', b.dataset.title || '');
   else if (act === 'upload') uploadBV(b.dataset.bv);
+  else if (act === 'show') openAppleShow(b.dataset.id, b.dataset.name);
+  else if (act === 'backshow') renderShows();
+  else if (act === 'epup') { $('input').value = b.dataset.link; doUpload(); }
   else if (act === 'qr') showQr('bili');
   else if (act === 'pop') popSearch();
+});
+$('sleepChips').addEventListener('click', e => {
+  const c = e.target.closest('.chip'); if (!c) return;
+  $('skw').value = c.dataset.kw;
+  doSearch();
 });
 function fmtPlay(n) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : String(n); }
 // 左右对照: 有搜索结果时把搜索框与音乐云盘并排, 同时查看已有哪些歌
@@ -3446,17 +4667,18 @@ document.addEventListener('keydown', e => {
   else if (!$('srcModal').hidden) closeSrc();
   else if (!$('lyricModal').hidden) closeLyric();
   else if (!$('pickModal').hidden) closePick();
+  else if (!$('favModal').hidden) closeFav();
   else if (!$('splitModal').hidden) closeSplit();
   else if (!$('accountModal').hidden) closeAccount();
   else if (!$('biliPanel').hidden) closeBiliPanel();
 });
 $('skw').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
-// 从任意文本里提取 B站/小宇宙链接与裸 BV 号(分享文案、多行文本都适用)
+// 从任意文本里提取 B站/小宇宙/苹果播客链接、音频直链与裸 BV 号(分享文案、多行文本都适用)
 function extractLinks(text) {
   const s = String(text || '');
   const urls = (s.match(/https?:\\/\\/[^\\s,，;；]+/g) || [])
     .map(u => u.replace(/[\\)\\]】。.,，]+$/, ''))
-    .filter(u => /b23\\.tv|bilibili\\.com|xiaoyuzhoufm\\.com/.test(u));
+    .filter(u => /b23\\.tv|bilibili\\.com|xiaoyuzhoufm\\.com|podcasts\\.apple\\.com|\\.(mp3|m4a|aac|flac|ogg|wav)(\\?|$)/i.test(u));
   const inUrl = new Set();
   for (const u of urls) for (const b of (u.match(/BV[0-9A-Za-z]{10}/g) || [])) inUrl.add(b.toLowerCase());
   const bvs = (s.match(/\\bBV[0-9A-Za-z]{10}\\b/g) || []).filter(b => !inUrl.has(b.toLowerCase()));
@@ -3480,7 +4702,7 @@ async function pasteClipboard() {
     return;
   }
   const found = extractLinks(text);
-  if (!found.length) { alert('剪贴板里没有找到 B 站链接、BV 号或小宇宙单集链接'); return; }
+  if (!found.length) { alert('剪贴板里没有找到 B 站链接、BV 号、播客单集或音频直链'); return; }
   const merged = [...new Set([...splitInput($('input').value), ...found])];
   $('input').value = merged.join(', ');
   $('input').focus();
@@ -3495,7 +4717,7 @@ async function doUpload(split) {
   saveForm();
   try {
     const res = await fetch('/api/upload', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ input, allPages: true, split, season: $('season').checked,
+      body: JSON.stringify({ input, type: curType, allPages: true, split, season: $('season').checked,
         clean: $('clean').checked, song: $('song').value.trim(), artist: $('artist').value.trim() }) });
     await readUploadStream(res, j => {
       if (j.type === 'done') {
@@ -3538,7 +4760,7 @@ restoreForm(); loadStatus(); loadList(); loadHistory();
 try {
   const savedTab = localStorage.getItem('bili2ncm.tab') || 'fix';
   const savedType = localStorage.getItem('bili2ncm.type');
-  curType = (savedType === 'pod' || savedTab === 'pod') ? 'pod' : 'music';
+  curType = (savedType === 'pod' || savedType === 'sleep') ? savedType : 'music';
   switchTab(savedTab === 'fix' ? 'fix' : 'up');
   switchType(curType);
 } catch (e) { switchTab('fix'); }
@@ -3555,8 +4777,13 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
 <style>
   html,body{margin:0;padding:0;height:100%;background:transparent;overflow:hidden;user-select:none}
   body{--lc:#ffffff;font:14px/1.5 "PingFang SC","Microsoft YaHei",-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased;color:#fff}
-  .wrap{height:calc(100% - 34px);margin-top:34px;display:flex;flex-direction:column;justify-content:center;padding:0 26px 4px;box-sizing:border-box;-webkit-app-region:no-drag}
-  .song{font-size:13px;font-weight:500;color:rgba(255,255,255,.6);text-shadow:0 1px 4px rgba(0,0,0,.9);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:.6px}
+  .wrap{height:100%;display:flex;flex-direction:column;justify-content:center;padding:0 26px 2px;box-sizing:border-box;-webkit-app-region:no-drag}
+  .songrow{position:relative;display:flex;align-items:center;gap:6px;min-width:0}
+  .song{flex:0 1 auto;min-width:0;font-size:13px;font-weight:500;color:rgba(255,255,255,.6);text-shadow:0 1px 4px rgba(0,0,0,.9);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:.6px}
+  .lyrsrc{flex:0 0 auto;font-size:9px;line-height:1;letter-spacing:.5px;padding:2px 5px;border-radius:6px;border:1px solid rgba(255,255,255,.22);color:rgba(255,255,255,.55);text-shadow:none;white-space:nowrap}
+  .lyrsrc[data-src="bilibili"]{border-color:rgba(251,114,153,.5);color:rgba(251,160,185,.85)}
+  .lyrsrc[data-src="netease"]{border-color:rgba(236,65,65,.5);color:rgba(255,130,130,.9)}
+  .lyrsrc[data-src="whisper"]{border-color:rgba(255,255,255,.2);color:rgba(255,255,255,.5)}
   .song,.cur,.next{-webkit-app-region:no-drag}
   .cur{margin-top:6px;line-height:1.32;letter-spacing:.2px;color:var(--lc);word-break:break-word;text-wrap:balance}
   @keyframes lyricSwap{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
@@ -3571,7 +4798,7 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
   body.s-minimal .next{display:none}
   body.s-custom .cur{font-size:calc(34px * var(--fs,1));font-weight:600;text-shadow:0 2px 14px rgba(0,0,0,.92)}
   body.s-custom .next{font-size:calc(19px * var(--fs,1));color:var(--lc);opacity:.6}
-  .bar{position:fixed;top:6px;right:10px;z-index:99;display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:6px;max-width:calc(100% - 20px);opacity:0;visibility:hidden;pointer-events:none;transition:opacity .18s;-webkit-app-region:no-drag}
+  .bar{position:absolute;top:-3px;left:0;z-index:99;display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;gap:6px;width:300px;max-width:100%;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .18s;-webkit-app-region:no-drag}
   .bar.on{opacity:1;visibility:visible;pointer-events:auto}
 
   body.locked .bar{display:none}
@@ -3586,63 +4813,85 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
   body.s-custom.o-soft .cur{text-shadow:0 2px 10px rgba(0,0,0,.9),0 0 2px rgba(0,0,0,.6)}
   body.s-custom.o-strong .cur{text-shadow:0 2px 10px rgba(0,0,0,.95),0 0 4px #000,0 0 2px #000}
   body.s-custom.hide-next .next{display:none}
-  .lockhint{position:fixed;top:8px;right:12px;z-index:98;font-size:11px;color:rgba(255,255,255,.78);background:rgba(20,20,24,.55);border:1px solid rgba(255,255,255,.16);border-radius:6px;padding:3px 8px;display:none;cursor:pointer;font-family:inherit;-webkit-app-region:no-drag}
-  body.locked .lockhint{display:block}
-  .bar button,.bar select,.bar input[type=color],.bar input[type=text]{background:rgba(20,20,24,.55);border:1px solid rgba(255,255,255,.18);color:rgba(255,255,255,.8);border-radius:6px;font-size:11px;font-family:inherit;outline:none;cursor:pointer;-webkit-app-region:no-drag}
-  .bar button{padding:3px 9px}
-  .bar input[type=text]{width:58px;height:22px;padding:0 6px;cursor:text;text-align:center}
-  .bar button:hover,.bar select:hover{border-color:#ec4141;color:#ec4141}
-  .bar select{height:22px;padding:0 4px}
-  .bar input[type=color]{width:26px;height:22px;padding:1px}
+  .lockhint{position:fixed;top:8px;right:12px;z-index:98;width:28px;height:26px;padding:0;color:rgba(255,255,255,.78);background:rgba(20,20,24,.55);border:1px solid rgba(255,255,255,.16);border-radius:9px;display:none;align-items:center;justify-content:center;cursor:pointer;font-family:inherit;-webkit-app-region:no-drag}
+  body.locked .lockhint{display:inline-flex}
+  .bar button,.bar select{background:rgba(20,20,24,.55);border:1px solid rgba(255,255,255,.18);color:rgba(255,255,255,.8);border-radius:9px;font-family:inherit;outline:none;cursor:pointer;-webkit-app-region:no-drag}
+  .bar .qbtn{width:28px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:13px;line-height:1;transition:transform .12s,border-color .12s}
+  .bar .qbtn.txt{font-size:10px;font-weight:600;letter-spacing:.3px}
+  .bar .qbtn:hover{transform:translateY(-1px)}
+  .bar button:hover,.bar select:hover,.lockhint:hover{border-color:#ec4141;color:#ec4141}
+  .bar select{height:26px;padding:0 3px 0 6px;font-size:11px;border-radius:9px}
+  #style{width:72px}#cw{width:54px}#co{width:68px}#cn{width:80px}
+  .bar .panel{position:absolute;top:calc(100% + 4px);bottom:auto;left:0;display:flex;align-items:center;gap:5px;width:300px;justify-content:center;padding:4px 5px;background:rgba(20,20,24,.55);border:1px solid rgba(255,255,255,.18);border-radius:10px;box-sizing:border-box}
+  .bar.pabove .panel{top:auto;bottom:calc(100% + 4px)}
+  .bar .panel[hidden]{display:none}
+  .bar .panel .sw{flex:0 0 auto;display:flex;align-items:center;gap:4px}
+  .bar .sw i{width:20px;height:20px;flex:0 0 auto}
+  .bar svg,.lockhint svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+  .song,.cur,.next{cursor:grab}
+  body.dragging .song,body.dragging .cur,body.dragging .next{cursor:grabbing}
 </style>
 </head>
 <body>
 <div class="bar">
-  <select id="style" title="歌词样式">
-    <option value="classic">经典</option>
-    <option value="neon">霓虹</option>
-    <option value="minimal">极简</option>
-    <option value="custom">自定义</option>
-  </select>
-  <input id="color" type="color" title="歌词颜色" />
-  <span class="sw" id="sw"></span>
-  <select id="cw" hidden title="字重">
-    <option value="400">常规</option><option value="700">加粗</option><option value="800">特粗</option>
-  </select>
-  <select id="co" hidden title="描边">
-    <option value="none">无描边</option><option value="soft">柔和描边</option><option value="strong">强描边</option>
-  </select>
-  <select id="cn" hidden title="下一句">
-    <option value="1">显示下一句</option><option value="0">只看一句</option>
-  </select>
-  <button id="minus" type="button">−1 秒</button>
-  <button id="plus" type="button">+1 秒</button>
-  <button id="seekBtn" type="button" title="输入当前播放时间(mm:ss)回车直接对齐">对齐</button>
-  <input id="seek" type="text" placeholder="mm:ss" hidden />
-  <button id="fdown" type="button">A−</button>
-  <button id="fup" type="button">A+</button>
-  <button id="lock" type="button" title="锁定后只保留解锁按钮，点击即可解锁">锁定</button>
-  <button id="close" type="button">关闭</button>
+  <button id="styleBtn" class="qbtn" type="button" title="歌词样式"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 0 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 0 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 0 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 0 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
+  <button id="colorBtn" class="qbtn" type="button" title="歌词颜色"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.2c3.4 3.9 6 6.9 6 9.8a6 6 0 1 1-12 0c0-2.9 2.6-5.9 6-9.8z"/></svg></button>
+  <button id="minus" class="qbtn txt" type="button" title="歌词进度 -1 秒">−1s</button>
+  <button id="plus" class="qbtn txt" type="button" title="歌词进度 +1 秒">+1s</button>
+  <button id="fdown" class="qbtn txt" type="button" title="字号变小">A−</button>
+  <button id="fup" class="qbtn txt" type="button" title="字号变大">A+</button>
+  <button id="lock" class="qbtn" type="button" title="锁定歌词"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4.5" y="10.5" width="15" height="10" rx="2.6"/><path d="M8 10.5V7.8a4 4 0 0 1 7.9-1.3"/></svg></button>
+  <button id="close" class="qbtn" type="button" title="关闭桌面歌词"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg></button>
+  <div class="panel" id="stylePanel" hidden>
+    <select id="style" title="歌词样式">
+      <option value="classic">经典</option>
+      <option value="neon">霓虹</option>
+      <option value="minimal">极简</option>
+      <option value="custom">自定义</option>
+    </select>
+    <select id="cw" hidden title="字重">
+      <option value="400">常规</option><option value="700">加粗</option><option value="800">特粗</option>
+    </select>
+    <select id="co" hidden title="描边">
+      <option value="none">无描边</option><option value="soft">柔和</option><option value="strong">强描边</option>
+    </select>
+    <select id="cn" hidden title="下一句">
+      <option value="1">显示下句</option><option value="0">只看本句</option>
+    </select>
+  </div>
+  <div class="panel" id="colorPanel" hidden>
+    <span class="sw" id="sw"></span>
+  </div>
 </div>
-<button class="lockhint" id="lockhint" type="button" title="点击解锁">已锁定 · 点击解锁</button>
+<button class="lockhint" id="lockhint" type="button" title="解锁歌词"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4.5" y="10.5" width="15" height="10" rx="2.6"/><path d="M8 10.5V7.5a4 4 0 1 1 8 0v3"/></svg></button>
 <div class="wrap">
-  <div class="song" id="song">正在连接网易云…</div>
+  <div class="songrow"><div class="song" id="song">正在连接网易云…</div><span class="lyrsrc" id="lyrsrc" hidden></span></div>
   <div class="cur dim" id="cur">等待播放…</div>
   <div class="next" id="next"></div>
 </div>
 <script>
 (function(){
-  var elSong=document.getElementById('song'),elCur=document.getElementById('cur'),elNext=document.getElementById('next');
+  var elSong=document.getElementById('song'),elCur=document.getElementById('cur'),elNext=document.getElementById('next'),elSrc=document.getElementById('lyrsrc');
   var basePos=0,baseAt=0,playing=false,lines=[],busy=false,lastIdx=-2,scale=1;
   try{ scale=parseFloat(localStorage.getItem('grayicu.lyric.scale')||'1')||1; }catch(e){}
   scale=Math.min(1.8,Math.max(0.7,scale));
   function applyScale(){ document.documentElement.style.setProperty('--fs', String(scale)); }
+  function paintSrc(src,verify){
+    var txt=src==='bilibili'?'B站字幕':src==='netease'?'网易云':src==='whisper'?'本地转写':'';
+    if(!txt){ elSrc.hidden=true; elSrc.textContent=''; placeBar(); return; }
+    elSrc.hidden=false;
+    elSrc.textContent=txt;
+    elSrc.dataset.src=src;
+    elSrc.title=src==='bilibili'?('B站字幕'+(verify==='none'?' · 未校对':'')):src==='netease'?'网易云歌词':'本地语音转写 · 未校对';
+    placeBar();
+  }
   function saveScale(){ try{ localStorage.setItem('grayicu.lyric.scale',String(scale)); }catch(e){} }
   applyScale();
-  var styleSel=document.getElementById('style'),colorEl=document.getElementById('color');
+  var styleSel=document.getElementById('style');
   var cwSel=document.getElementById('cw'),coSel=document.getElementById('co'),cnSel=document.getElementById('cn'),swBox=document.getElementById('sw');
+  var stylePanel=document.getElementById('stylePanel'),colorPanel=document.getElementById('colorPanel');
   var style='classic',lcolor='#ffffff',cw='700',co='soft',cn='1';
-  var SWATCHES=['#ffffff','#ffd166','#ff8fa3','#7bdff2','#b8f2a0','#ec4141'];
+  var SWATCHES=['#ffffff','#ffe9a8','#ffd166','#ffb4c0','#ff8fa3','#ff6b6b','#ec4141','#b388ff','#7bdff2','#4dd0e1','#b8f2a0','#cfd8dc'];
   try{
     style=localStorage.getItem('grayicu.lyric.style')||'classic';
     lcolor=localStorage.getItem('grayicu.lyric.color')||'#ffffff';
@@ -3658,7 +4907,7 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
   SWATCHES.forEach(function(c){
     var d=document.createElement('i');
     d.style.background=c; d.setAttribute('data-c',c); d.title=c;
-    d.onclick=function(){ setColor(c); };
+    d.onclick=function(){ setColor(c); colorPanel.hidden=true; };
     swBox.appendChild(d);
   });
   function applyTheme(){
@@ -3670,7 +4919,7 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
     document.body.classList.add('o-'+co);
     document.body.classList.toggle('hide-next', cn==='0');
     document.body.style.setProperty('--lc',lcolor);
-    styleSel.value=style; colorEl.value=lcolor;
+    styleSel.value=style;
     cwSel.value=cw; coSel.value=co; cnSel.value=cn;
     var showCustom=(style==='custom');
     cwSel.hidden=!showCustom; coSel.hidden=!showCustom; cnSel.hidden=!showCustom;
@@ -3679,7 +4928,6 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
   function setColor(c){
     lcolor=c;
     try{ localStorage.setItem('grayicu.lyric.color',lcolor); }catch(e){}
-    colorEl.value=lcolor;
     document.body.style.setProperty('--lc',lcolor);
     markSw();
   }
@@ -3688,12 +4936,33 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
     try{ localStorage.setItem('grayicu.lyric.style',style); }catch(e){}
     applyTheme();
   };
-  colorEl.oninput=function(){ setColor(colorEl.value); };
   cwSel.onchange=function(){ cw=cwSel.value; try{ localStorage.setItem('grayicu.lyric.w',cw); }catch(e){} applyTheme(); };
   coSel.onchange=function(){ co=coSel.value; try{ localStorage.setItem('grayicu.lyric.o',co); }catch(e){} applyTheme(); };
   cnSel.onchange=function(){ cn=cnSel.value; try{ localStorage.setItem('grayicu.lyric.n',cn); }catch(e){} applyTheme(); };
   applyTheme();
-  var lockBtn=document.getElementById('lock'), hintBtn=document.getElementById('lockhint'), barEl=document.querySelector('.bar');
+  // 样式/颜色面板默认收起, 点图标才展开; 两个面板同时只开一个
+  document.getElementById('styleBtn').onclick=function(){
+    stylePanel.hidden=!stylePanel.hidden;
+    if(!stylePanel.hidden) colorPanel.hidden=true;
+  };
+  document.getElementById('colorBtn').onclick=function(){
+    colorPanel.hidden=!colorPanel.hidden;
+    if(!colorPanel.hidden) stylePanel.hidden=true;
+  };
+  var lockBtn=document.getElementById('lock'), hintBtn=document.getElementById('lockhint'), barEl=document.querySelector('.bar'), songRow=document.querySelector('.songrow');
+  // 工具条嵌到歌名行, 紧跟在音源标签后面; 绝对定位不挤占歌名
+  if(barEl&&songRow) songRow.appendChild(barEl);
+  function placeBar(){
+    if(!barEl||!songRow) return;
+    var row=songRow.getBoundingClientRect();
+    var anchor=(elSrc&&!elSrc.hidden?elSrc:elSong).getBoundingClientRect();
+    var x=Math.round(anchor.right-row.left+8);
+    var max=Math.round(row.width-(barEl.offsetWidth||300)-2);
+    barEl.style.left=Math.min(Math.max(0,x),Math.max(0,max))+'px';
+    // 上方空间不够时, 面板改为向下展开
+    barEl.classList.toggle('pabove', Math.round(row.top)-37>=0);
+  }
+  placeBar();
   var isLocked=false, lastIgnore=null, lastX=0, lastY=0, rectCache=[], rectAt=0, dragging=false, barTimer=null;
   function canIPC(){ return !!(window.GrayIPC && window.GrayIPC.setIgnore); }
   function setIgnore(v){ if(lastIgnore===v) return; lastIgnore=v; if(canIPC()) window.GrayIPC.setIgnore(v); }
@@ -3714,41 +4983,87 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
     var r=el.getBoundingClientRect();
     return r.width>1&&r.height>1&&inR(x,y,r);
   }
-  function isHot(x,y){
-    if(isLocked) return boxHot(hintBtn,x,y);
+  // 工具条展开时整块算"热区", 避免面板/色点缝隙穿透
+  function barHot(x,y){
+    if(!barEl||!barEl.classList.contains('on')) return false;
     if(boxHot(barEl,x,y)) return true;
+    var ps=barEl.querySelectorAll('.panel');
+    for(var i=0;i<ps.length;i++){
+      if(ps[i].hidden) continue;
+      var r=ps[i].getBoundingClientRect();
+      if(r.width>1&&r.height>1&&inR(x,y,r)) return true;
+    }
+    return false;
+  }
+  function textHot(x,y){
     var rs=textRects();
     for(var i=0;i<rs.length;i++){ if(inR(x,y,rs[i])) return true; }
     return false;
   }
-  function showBar(){ if(barTimer){ clearTimeout(barTimer); barTimer=null; } if(barEl) barEl.classList.add('on'); }
+  function isHot(x,y){
+    if(isLocked) return boxHot(hintBtn,x,y);
+    // 歌词文字也可直接拖动, 所以文字矩形同样作为热区
+    return barHot(x,y)||textHot(x,y);
+  }
+  function showBar(){
+    if(barTimer){ clearTimeout(barTimer); barTimer=null; }
+    if(barEl){ placeBar(); barEl.classList.add('on'); }
+  }
   function scheduleHideBar(){
     if(barTimer||!barEl) return;
-    barTimer=setTimeout(function(){ barTimer=null; if(barEl) barEl.classList.remove('on'); },3000);
+    barTimer=setTimeout(function(){
+      barTimer=null;
+      if(barEl) barEl.classList.remove('on');
+      stylePanel.hidden=true; colorPanel.hidden=true;
+    },3000);
   }
   document.addEventListener('mousemove', function(e){
     if(!canIPC()) return;
     lastX=e.clientX; lastY=e.clientY;
+    if(dragPending){
+      // 按住歌词后移动超过阈值才算拖动, 避免轻轻一点就整窗乱跑
+      if(Math.abs(e.clientX-dragPending.x)+Math.abs(e.clientY-dragPending.y)>4){
+        dragPending=null; startDrag();
+      }
+      return;
+    }
     if(dragging) return;
     var hot=isHot(lastX,lastY);
     setIgnore(!hot);
     if(hot) showBar(); else scheduleHideBar();
   });
-  document.addEventListener('mouseleave', function(){ if(!dragging) setIgnore(true); });
+  // 鼠标离开窗口时也要开始 3 秒倒计时, 否则工具条会一直挂在那里
+  document.addEventListener('mouseleave', function(){
+    dragPending=null;
+    if(dragging) return;
+    setIgnore(true);
+    scheduleHideBar();
+  });
+  function startDrag(){
+    if(dragging||isLocked) return;
+    if(!(window.GrayIPC&&window.GrayIPC.dragStart)) return;
+    dragging=true;
+    document.body.classList.add('dragging');
+    setIgnore(false);
+    window.GrayIPC.dragStart();
+  }
   function endDrag(){
+    dragPending=null;
     if(!dragging) return;
     dragging=false;
+    document.body.classList.remove('dragging');
     if(window.GrayIPC&&window.GrayIPC.dragEnd) window.GrayIPC.dragEnd();
-    setIgnore(!isHot(lastX,lastY));
+    var hot=isHot(lastX,lastY);
+    setIgnore(!hot);
+    if(hot) showBar(); else scheduleHideBar();
   }
+  var dragPending=null;
   document.addEventListener('mousedown', function(e){
-    if(isLocked||dragging) return;
+    if(isLocked||dragging||e.button!==0) return;
     if(!(window.GrayIPC&&window.GrayIPC.dragStart)) return;
-    var t=e.target;
-    if(!(t===elSong||t===elCur||t===elNext)) return;
-    dragging=true;
+    if(!textHot(e.clientX,e.clientY)) return;
+    dragPending={x:e.clientX,y:e.clientY};
     e.preventDefault();
-    window.GrayIPC.dragStart();
   });
   document.addEventListener('mouseup', endDrag);
   window.addEventListener('blur', endDrag);
@@ -3771,19 +5086,6 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
   document.getElementById('fup').onclick=function(){ scale=Math.min(1.8,scale+0.1); applyScale(); saveScale(); };
   document.getElementById('minus').onclick=function(){ nudge(-1); };
   document.getElementById('plus').onclick=function(){ nudge(1); };
-  var seekEl=document.getElementById('seek');
-  document.getElementById('seekBtn').onclick=function(){
-    seekEl.hidden=!seekEl.hidden;
-    if(!seekEl.hidden){ seekEl.focus(); seekEl.select(); }
-  };
-  seekEl.onkeydown=function(e){
-    if(e.key!=='Enter') return;
-    var v=seekEl.value.trim(), m=v.match(/^(\\d{1,3}):([0-5]?\\d)$/);
-    if(!m) return;
-    var sec=parseInt(m[1],10)*60+parseInt(m[2],10);
-    seekEl.hidden=true; seekEl.blur();
-    fetch('/api/live',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seek:sec})}).then(poll);
-  };
   document.getElementById('close').onclick=function(){ window.close(); };
   function nudge(v){
     fetch('/api/live',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({nudge:v})}).then(poll);
@@ -3808,7 +5110,16 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
     for(var i=0;i<lines.length;i++){ if(lines[i].t<=p) idx=i; else break; }
     if(idx===lastIdx) return;
     lastIdx=idx;
-    if(idx<0){ setLine('…','',true); return; }
+    if(idx<0){
+      // 前奏/刚换歌/暂停在开头: 展示第一句, 不要只显示一个省略号让人以为没歌词
+      // 播放中淡色表示"还没唱到"; 暂停时按正常颜色, 因为用户就是要看当前这句
+      var f=lines[0]?lines[0].text:'';
+      var n2=lines[1]?lines[1].text:'';
+      if(elCur.textContent!==f) swapText(elCur,f);
+      elCur.classList.toggle('dim', !!playing);
+      if(elNext.textContent!==n2) elNext.textContent=n2;
+      return;
+    }
     var nxt=(idx+1<lines.length)?lines[idx+1].text:'';
     if(elCur.textContent!==lines[idx].text){ swapText(elCur,lines[idx].text); elCur.classList.remove('dim'); }
     if(elNext.textContent!==nxt) elNext.textContent=nxt;
@@ -3818,11 +5129,12 @@ const DLYRIC_PAGE = `<!DOCTYPE html>
     fetch('/api/live').then(function(r){return r.json();}).then(function(j){
       busy=false;
       if(!j||!j.ok) return;
-      lines=j.lines||[];
+      lines=(j.lines||[]).filter(function(l){ return l && typeof l.t==='number' && l.t>=0 && l.t<=21600 && l.text; });
       basePos=j.pos||0; baseAt=performance.now()/1000; playing=!!j.playing;
-      if(!j.title){ setLine('等待播放…','',true); elSong.textContent='网易云没在放歌'; return; }
+      if(!j.title){ setLine('等待播放…','',true); elSong.textContent='网易云没在放歌'; paintSrc('',''); return; }
       elSong.textContent=j.title+(j.artist?' · '+j.artist:'');
-      if(!lines.length){ setLine(j.error?j.error:'正在找歌词…','',true); return; }
+      paintSrc(j.src,j.verify);
+      if(!lines.length){ setLine(j.error?j.error:'正在找歌词…','',true); paintSrc('',''); return; }
       lastIdx=-2; render();
     }).catch(function(){ busy=false; });
   }
@@ -4145,12 +5457,15 @@ http.createServer((rq, rs) => {
   if (rq.method === 'GET' && url === '/api/nowplaying') {
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     ensureSmWatcher();
-    if (pushFresh()) {
-      const now = Date.now() / 1000;
-      rs.end(JSON.stringify({ playing: pushState.status !== 'Paused', title: pushState.title, artist: pushState.artist, status: pushState.status, src: 'plugin', pos: pushLivePos(now), dur: pushState.dur, ncmId: pushState.ncmId }));
-      return;
-    }
-    rs.end(JSON.stringify(smState));
+    // 统一走 liveTickState: 暂停/桥接停推时也要保留冻结进度, 不能退回只剩窗口标题的假播放状态
+    const s = liveTickState();
+    rs.end(JSON.stringify({
+      playing: s.playing, title: s.title, artist: s.artist,
+      status: s.playing ? 'Playing' : 'Paused',
+      src: pushFresh() ? (pushState.src || 'plugin') : (smState.src || 'none'),
+      pos: s.pos, dur: s.audioDur || s.dur,
+      ncmId: pushState ? pushState.ncmId : 0,
+    }));
     return;
   }
   if (url === '/api/push' && (rq.method === 'POST' || rq.method === 'OPTIONS')) {
@@ -4166,10 +5481,42 @@ http.createServer((rq, rs) => {
         const srcTag = String(o.src || 'plugin');
         if (srcTag !== 'cdp' && cdpFresh()) { rs.end('{"ok":true,"ignored":1}'); return; }
         if (srcTag === 'cdp') cdpLastPushAt = Date.now();
+        const nowSec = Date.now() / 1000;
+        const nTitle = String(o.title || ''), nArtist = String(o.artist || '');
+        // 暂停/切歌瞬间桥接偶尔会推一条空歌名, 如果照单全收会把当前曲目清空,
+        // 表现就是歌词窗闪一下"等待播放"再跳回第一句, 这里直接忽略
+        if (!nTitle) { rs.end('{"ok":true,"ignored":1}'); return; }
+        const nPos = Number.isFinite(pos) && pos >= 0 ? pos : -1;
+        const prev = pushState;
+        const sameTrack = !!prev && sameTrackKey(nTitle, nArtist, prev.title, prev.artist);
+        let monoPos, monoAt;
+        if (!sameTrack) {
+          // 换歌: 锚点从这次上报的位置重新开始
+          monoPos = Math.max(0, nPos);
+          monoAt = nowSec;
+        } else {
+          const prevMono = prev.monoPos != null ? prev.monoPos : prev.pos;
+          const prevAt = prev.monoAt != null ? prev.monoAt : prev.posAt;
+          // 插件上报的 pos 有时是失真的(进度事件没触发时会一直停在一个旧值, 甚至归零),
+          // 所以用"本地估算 + 只接受不倒退的上报"来保证暂停时停在当前这句, 而不是跳回第一句
+          const estNow = prev.status === 'Paused' ? prevMono : prevMono + Math.max(0, nowSec - (prevAt || nowSec));
+          if (!playing) {
+            // 暂停: 把位置冻结在暂停那一刻的估算值, 不接受可能失真的 pos
+            if (prev.status === 'Paused') { monoPos = prevMono; monoAt = prevAt; }
+            else { monoPos = estNow; monoAt = nowSec; }
+          } else if (nPos >= 0 && nPos >= estNow - 1.5) {
+            // 正常前进或向前跳转: 以新值为锚点
+            monoPos = nPos; monoAt = nowSec;
+          } else {
+            // 明显落后(或上报为 0): 视为失效数据, 继续用本地时钟
+            monoPos = prevMono; monoAt = prevAt;
+          }
+        }
         pushState = {
           playing,
-          title: String(o.title || ''),
-          artist: String(o.artist || ''),
+          title: nTitle,
+          artist: nArtist,
+          monoPos, monoAt, lastPushed: nPos,
           album: String(o.album || ''),
           ncmId: Number(o.ncmId) || 0,
           src: srcTag,
@@ -4223,22 +5570,87 @@ http.createServer((rq, rs) => {
         const songId = String(o.songId || '').replace(/[^0-9]/g, '');
         if (!title || !songId) return rs.end(JSON.stringify({ ok: false, error: '参数不全' }));
         const r = await lyricBySongId(songId);
-        const n = lrcLines(r.lrc).length;
-        if (n < 2 || isJunkLyric(r.lrc)) return rs.end(JSON.stringify({ ok: false, error: '这个版本没有可用歌词(纯音乐/占位), 换一个试试' }));
-        lyrIdxPut(title, artist, {
+        // 手动换版本同样走二次校验, 避免把别的版本/纯音乐占位写进索引
+        const curDur = pushFresh() && pushState.title === title && pushState.artist === artist ? Math.round(pushState.dur * 1000) : 0;
+        const v = lrcAudit(r.lrc, { durSec: curDur / 1000, minLines: 3 });
+        if (!v.ok) return rs.end(JSON.stringify({ ok: false, error: '这个版本没有可用歌词(' + v.reason + '), 换一个试试' }));
+        const rec = lyrIdxPut(title, artist, {
           songId, name: String(o.name || title), artist: String(o.artistName || artist),
           durMs: Number(o.durMs) || 0, lrc: r.lrc, tlrc: r.tlrc, manual: true,
-          audioDurMs: pushFresh() && pushState.dur > 0 ? Math.round(pushState.dur * 1000) : 0,
+          audioDurMs: curDur,
           offset: lyrIdxOffset(title, artist),
         });
+        if (!rec) return rs.end(JSON.stringify({ ok: false, error: '这个版本的歌词数据异常, 换一个试试' }));
         LYRIC_CACHE.delete(title + '|' + artist);
         // 正在放这首歌就直接重新加载, 不用等下一首
         if (live.title === title && live.artist === artist) {
           liveLoad(live.key, live.title, live.artist, pushFresh() ? pushState.dur : 0);
         }
-        rs.end(JSON.stringify({ ok: true, songId, lines: n, name: String(o.name || title) }));
+        rs.end(JSON.stringify({ ok: true, songId, lines: v.lines, name: String(o.name || title) }));
       } catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
     });
+    return;
+  }
+  if (rq.method === 'POST' && url === '/api/lyric/stt') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    let body = '';
+    rq.on('data', d => body += d);
+    rq.on('end', async () => {
+      const send = msg => { try { rs.write(JSON.stringify({ type: 'log', msg }) + '\n'); } catch (e) {} };
+      try {
+        if (sttBusy) throw new Error('已经在补另一首, 请等它跑完');
+        const o = JSON.parse(body || '{}');
+        const title = String(o.title || '').trim(), artist = String(o.artist || '').trim();
+        if (!title) throw new Error('缺少歌名');
+        const r = await sttLyricForSong(title, artist, send);
+        rs.end(JSON.stringify({ type: 'done', ...r }) + '\n');
+      } catch (e) {
+        if (e.message === '__canceled__') return rs.end(JSON.stringify({ type: 'canceled' }) + '\n');
+        rs.end(JSON.stringify({ type: 'error', msg: e.message }) + '\n');
+      }
+    });
+    return;
+  }
+  if (rq.method === 'POST' && url === '/api/lyric/stt/stop') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    sttStopping = true;
+    if (sttChild) { try { sttChild.kill(); } catch (e) {} }
+    rs.end(JSON.stringify({ ok: true, stopped: !!sttChild }));
+    return;
+  }
+  if (rq.method === 'POST' && url === '/api/lyric/drop') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    let body = '';
+    rq.on('data', d => body += d);
+    rq.on('end', async () => {
+      try {
+        const o = JSON.parse(body || '{}');
+        const title = String(o.title || '').trim(), artist = String(o.artist || '').trim();
+        if (!title) return rs.end(JSON.stringify({ ok: false, error: '缺少歌名' }));
+        lyrIdxDrop(title, artist);
+        LYRIC_CACHE.delete(title + '|' + artist);
+        // 正在放这首歌就立刻重找联网歌词, 不用等下一首
+        if (live.title === title && live.artist === artist) {
+          liveLoad(live.key, live.title, live.artist, pushFresh() ? pushState.dur : 0);
+        }
+        rs.end(JSON.stringify({ ok: true }));
+      } catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+    });
+    return;
+  }
+  if (url === '/api/lyric/batch' && rq.method !== 'POST') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    rs.end(JSON.stringify(lyrBatchSnap()));
+    return;
+  }
+  if (rq.method === 'POST' && url === '/api/lyric/batch/start') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    rs.end(JSON.stringify({ ok: true, ...lyrBatchStart() }));
+    return;
+  }
+  if (rq.method === 'POST' && url === '/api/lyric/batch/stop') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    rs.end(JSON.stringify({ ok: true, stopped: lyrBatchStop() }));
     return;
   }
   if (url === '/api/ncm/status') {
@@ -4246,7 +5658,8 @@ http.createServer((rq, rs) => {
     (async () => {
       let portOpen = false;
       try { const l = await cdpTargets(); portOpen = !!(l && l.length); } catch (e) {}
-      rs.end(JSON.stringify({ port: NCM_DEBUG_PORT, portOpen, injected: !!cdpInjectedAt, cdpLive: cdpFresh(), plugin: pushFresh(), src: pushState ? (pushState.src || 'plugin') : 'none', error: cdpErr }));
+      const li = await ncmLaunchInfo();
+      rs.end(JSON.stringify({ port: NCM_DEBUG_PORT, portOpen, injected: !!cdpInjectedAt, cdpLive: cdpFresh(), plugin: pushFresh(), src: pushState ? (pushState.src || 'plugin') : 'none', ncmRunning: li.running, launchedWithPort: li.withPort, launchedPort: li.port, error: cdpErr }));
     })();
     return;
   }
@@ -4346,6 +5759,26 @@ http.createServer((rq, rs) => {
       } catch (e) {
         rs.end(JSON.stringify({ items: [], error: e.message }));
       }
+    })();
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/podcast/search') {
+    const kw = (new URL(rq.url, 'http://x').searchParams.get('kw') || '').trim();
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    if (!kw) return rs.end(JSON.stringify({ items: [] }));
+    (async () => {
+      try { rs.end(JSON.stringify({ items: await appleSearch(kw) })); }
+      catch (e) { rs.end(JSON.stringify({ items: [], error: '播客搜索失败, 请稍后再试' })); }
+    })();
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/podcast/episodes') {
+    const id = (new URL(rq.url, 'http://x').searchParams.get('id') || '').trim();
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    if (!/^\d+$/.test(id)) return rs.end(JSON.stringify({ items: [] }));
+    (async () => {
+      try { rs.end(JSON.stringify({ items: await appleEpisodes(id) })); }
+      catch (e) { rs.end(JSON.stringify({ items: [], error: '单集读取失败, 请稍后再试' })); }
     })();
     return;
   }
