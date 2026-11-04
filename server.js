@@ -913,12 +913,20 @@ function pickAudio(dash, quality) {
 // 智能清洗歌名: 去序号前缀/【】[]标签, 拆"歌手-歌名"结构 (右段含版本词时不拆, 如"晴天-周杰伦版")
 function cleanSongName(raw) {
   let s = String(raw || '').trim();
-  s = s.replace(/^[0-9]{1,4}[.、\-\s]+/, '').replace(/[【\[].*?[】\]]/g, '').replace(/\s{2,}/g, ' ').trim();
+  s = s.replace(/^[0-9]{1,4}[.、\-\s]+/, '').replace(/[【\[].*?[】\]]/g, '')
+    .replace(/[（(]\s*(?:无损音质|高音质|无损|高清|完整版|修复版|HQ|Hi-Res)\s*[)）]/gi, '')
+    .replace(/\s{2,}/g, ' ').trim();
   if (!s) return null;
+  // 《歌名》—歌手 结构 (B站修复版/翻唱常见), 右侧去掉音质类修饰
+  const bm = s.match(/^《([^》]{1,40})》\s*[-–—~·]?\s*(.*)$/);
+  if (bm) {
+    const artist = bm[2].replace(/(?:无损音质|高音质|无损|高清|完整版|修复版)/gi, '').trim();
+    return { song: bm[1].trim(), artist: artist || null };
+  }
   const m = s.match(/^([^\-–—]{1,16}?)\s*[-–—]\s*(.{1,40})$/);
   if (m && m[1].trim() && m[2].trim() && !/版|翻唱|伴奏|cover|live|remix|纯音乐|钢琴|八音盒|串烧|混剪|DJ/i.test(m[2].trim()))
     return { song: m[2].trim(), artist: m[1].trim() };
-  return { song: s, artist: null };
+  return { song: s.replace(/(?:无损音质|高音质|无损|高清|完整版)$/, '').trim(), artist: null };
 }
 async function biliHeaders() {
   const c = readBiliCookie();
@@ -1088,8 +1096,8 @@ async function audioUrlUpload(a, opts, send) {
 
   const songName = sanitize(opts.song || title);
   const artist = sanitize(opts.artist || '直链音频');
-  // 播客/助眠里的直链也归入播客, 避免把助眠/播客音频送进歌词批处理
-  const source = (opts.type === 'pod' || opts.type === 'sleep') ? '播客' : '直链';
+  // 播客入口下的直链归入播客, 避免把播客音频送进歌词批处理
+  const source = opts.type === 'pod' ? '播客' : '直链';
   const ups = await uploadAudioAuto({
     buffer: buf, ext, filename: songName + '.' + ext,
     song: songName, artist, album: '', contentType: contentTypeFor(ext), send, split: !!opts.split,
@@ -1247,7 +1255,10 @@ async function biliUpload(input, opts, send) {
   for (let i = 0; i < targets.length; i++) {
     const pg = targets[i];
     // 命名优先级: 手动指定 > (清洗开启时)清洗分P名 > 原始分P名 > 视频标题
-    const rawName = pg.part && pg.part !== title ? pg.part : title;
+    // 分P名是纯数字(UP主拿ID当分P名)时不采用, 回退到视频标题
+    const partName = String(pg.part || '').trim();
+    const usablePart = partName && !/^\d{5,}$/.test(partName);
+    const rawName = usablePart && partName !== title ? partName : title;
     let songName, artist;
     if (opts.song) {
       songName = sanitize(opts.song);
@@ -2804,11 +2815,9 @@ const PAGE = `<!DOCTYPE html>
   .tab:hover{color:var(--t1)}
   .tab.on{background:#fff;color:var(--red);font-weight:500;box-shadow:0 1px 3px rgba(0,0,0,.06)}
   .seg{display:inline-flex;gap:2px;background:#f1f1f4;border-radius:9px;padding:3px;margin-bottom:14px}
-  .seg-btn{height:28px;padding:0 18px;border:none;border-radius:7px;background:transparent;color:var(--t2);font-size:12.5px;cursor:pointer;transition:background .15s,color .15s}
+  .seg-btn{height:28px;padding:0 16px;border:none;border-radius:7px;background:transparent;color:var(--t2);font-size:12.5px;cursor:pointer;transition:background .15s,color .15s;display:inline-flex;align-items:center;gap:5px}
+  .seg-btn .ico{width:14px;height:14px;flex:none}
   .seg-btn.on{background:#fff;color:var(--red);font-weight:500;box-shadow:0 1px 3px rgba(0,0,0,.06)}
-  .chips{display:flex;gap:8px;flex-wrap:wrap;margin:-2px 0 12px}
-  .chip{height:28px;padding:0 12px;border:1px solid var(--line);border-radius:14px;background:#fff;color:var(--t2);font-size:12px;cursor:pointer;transition:border-color .15s,color .15s}
-  .chip:hover{border-color:var(--red);color:var(--red)}
   .account{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--t2)}
   .dot{width:7px;height:7px;border-radius:50%;background:#c9c9cf}
   .dot.on{background:var(--ok)} .dot.off{background:var(--bad)}
@@ -2954,9 +2963,14 @@ const PAGE = `<!DOCTYPE html>
     .compare.split #sres,.compare.split #list{overflow:visible}
   }
 
-  .cloud-head{display:flex;align-items:center;justify-content:space-between;padding-bottom:12px}
-  .cloud-right{display:flex;align-items:center;gap:12px}
-  .cloud-meta{font-size:12px;color:var(--t3);font-variant-numeric:tabular-nums}
+  .cloud-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:12px}
+  .cloud-title{display:flex;flex-direction:column;gap:3px;min-width:0}
+  .cloud-title h2{white-space:nowrap}
+  .cloud-right{display:flex;align-items:center;gap:8px;flex:none}
+  .ico-btn{width:30px;height:30px;padding:0;display:inline-flex;align-items:center;justify-content:center;border-radius:7px}
+  .cloud-meta{font-size:11.5px;color:var(--t3);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .batch-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:2px 0 10px;font-size:12px;color:var(--t3)}
+  .batch-chk{width:14px;height:14px;margin-right:7px;vertical-align:-2px;accent-color:var(--red);cursor:pointer}
   .song{display:grid;grid-template-columns:1fr 1fr 108px 88px;grid-template-areas:"name artist meta acts";align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line-soft);font-size:13px}
   .s-name{grid-area:name;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .s-artist{grid-area:artist;min-width:0;color:var(--t2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2972,6 +2986,12 @@ const PAGE = `<!DOCTYPE html>
   .sr-btns{display:flex;gap:8px;flex-wrap:wrap}
   .sr-head .chk{padding:2px 0}
   .badge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:4px;background:#fdeeee;color:var(--red);font-size:11px;font-weight:400;vertical-align:1px}
+  .qtag{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:4px;border:1px solid;font-size:11px;font-weight:500;vertical-align:1px}
+  .qtag.loading{color:#aaa;background:#f7f7f8;border-color:#ececf0;font-weight:400}
+  .qtag.hires{color:#7a4a00;background:#fff7e6;border-color:#f0d9a8}
+  .qtag.q192{color:#0b7a4b;background:#e9f8f1;border-color:#bfe8d5}
+  .qtag.q132{color:#2456a6;background:#eaf1fc;border-color:#c9dcf7}
+  .qtag.q64{color:#777;background:#f3f3f5;border-color:#e2e2e6}
   .sr{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 0;border-top:1px solid var(--line-soft);font-size:13px}
   .sr-l{min-width:0}
   .sr-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -3109,9 +3129,8 @@ const PAGE = `<!DOCTYPE html>
 
   <section class="card" id="uploadCard" hidden>
     <div class="seg" role="tablist" aria-label="上传类型">
-      <button class="seg-btn on" data-type="music" onclick="switchType('music')">音乐</button>
-      <button class="seg-btn" data-type="pod" onclick="switchType('pod')">播客</button>
-      <button class="seg-btn" data-type="sleep" onclick="switchType('sleep')">助眠</button>
+      <button class="seg-btn on" data-type="music" onclick="switchType('music')"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2Z" fill="none" stroke="#fb7299" stroke-width="1.9"/><path d="M7 2.8l3.1 3.2M17 2.8l-3.1 3.2" fill="none" stroke="#fb7299" stroke-width="1.9"/><circle cx="8.6" cy="12.6" r="1.5" fill="#fb7299"/><circle cx="15.4" cy="12.6" r="1.5" fill="#fb7299"/></svg>音乐</button>
+      <button class="seg-btn" data-type="pod" onclick="switchType('pod')"><svg class="ico" viewBox="0 0 384 512" aria-hidden="true"><path d="M318.7 268.7c-.2-36.7 16.4-64.4 50-84.8-18.8-26.9-47.2-41.7-84.7-44.6-35.5-2.7-74.2 20.7-94.5 20.7-19.4 0-51.1-20.7-79.4-20.7-43.6 0-84.1 25.3-106.6 64.1-45.9 79.8-11.4 197.7 32.9 262.6 21.9 32.5 47.2 69 80.9 70.2h.8c31.6 0 49.5-20.3 92.9-20.3 32.4 0 49.4 18.1 77.7 18.1h.8c35.1 0 61.7-32.1 84.4-69.6 24.3-39.7 34.4-77.6 35.1-79.6-1.6-.7-63.3-26.1-63.9-78.4zM233 97.6c17-20.6 28.2-49.2 25.1-77.6-23.5 1-51.8 15.6-68.7 35.4-15.7 18.4-29.5 48.4-25.5 76.5 25.6 2 53.2-14.7 69.1-34.3z" fill="#333"/></svg>播客</button>
     </div>
     <div class="upload">
       <textarea id="input" rows="1" placeholder="粘贴 B 站视频/合集页链接、音频直链或 BV 号，多个用逗号分隔"></textarea>
@@ -3123,7 +3142,6 @@ const PAGE = `<!DOCTYPE html>
       <label class="chk" title="去序号/标签, 拆分'歌手-歌名', 歌手字段自动纠正"><input type="checkbox" id="clean" checked>整理歌名</label>
       <button class="link" onclick="toggleMore()" type="button">手动指定歌名</button>
     </div>
-    <p class="hint" id="podHint" hidden>粘贴苹果播客单集链接（podcasts.apple.com/…?i=…），小宇宙单集链接仍可用；超过 200MB 时会先询问是否拆分成多个文件。</p>
     <div class="more" id="more">
       <input type="text" id="song" placeholder="歌名 (留空=自动)">
       <input type="text" id="artist" placeholder="歌手 (留空=自动)">
@@ -3153,25 +3171,26 @@ const PAGE = `<!DOCTYPE html>
         <input type="text" id="skw" placeholder="搜索 B 站歌曲/翻唱/演唱会…">
         <button class="btn" id="sbtn" onclick="doSearch()">搜索</button>
       </div>
-      <div class="chips" id="sleepChips" hidden>
-        <button class="chip" data-kw="雨声">雨声</button>
-        <button class="chip" data-kw="白噪音">白噪音</button>
-        <button class="chip" data-kw="篝火">篝火</button>
-        <button class="chip" data-kw="ASMR">ASMR</button>
-        <button class="chip" data-kw="冥想">冥想</button>
-        <button class="chip" data-kw="轻音乐">轻音乐</button>
-      </div>
       <div id="sres" hidden></div>
       <div class="search-empty" id="searchHint">输入歌名后点「搜索」，结果会显示在这里，可与右侧云盘对照</div>
     </section>
 
     <section class="card cloud">
       <div class="cloud-head">
-        <h2>音乐云盘</h2>
-        <div class="cloud-right">
+        <div class="cloud-title">
+          <h2>音乐云盘</h2>
           <span class="cloud-meta" id="stats"></span>
-          <button class="mini" onclick="loadList()">刷新</button>
         </div>
+        <div class="cloud-right">
+          <button class="mini" id="batchBtn" onclick="toggleBatch()">批量收藏</button>
+          <button class="mini ico-btn" onclick="loadList()" title="刷新云盘" aria-label="刷新云盘"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>
+        </div>
+      </div>
+      <div class="batch-bar" id="batchBar" hidden>
+        <button class="mini" onclick="selectAllCloud(true)">全选</button>
+        <button class="mini" onclick="selectAllCloud(false)">清空</button>
+        <span id="batchCount">已选 0 首</span>
+        <button class="mini primary" onclick="openBatchFav()">收藏到歌单</button>
       </div>
       <div id="list"></div>
     </section>
@@ -3243,8 +3262,8 @@ const PAGE = `<!DOCTYPE html>
     </div>
     <div id="guideUp" hidden>
       <div class="guide-step"><span class="guide-num">1</span><span>右上角「账号」里分别扫码登录网易云和 B 站：网易云用来接收云盘，B 站用来读取音源。</span></div>
-      <div class="guide-step"><span class="guide-num">2</span><span>顶部「上传」里切换「音乐」「播客」或「助眠」。</span></div>
-      <div class="guide-step"><span class="guide-num">3</span><span>音乐：粘贴 B 站视频/合集链接、BV 号或音频直链；播客：搜索苹果播客并选单集，也可粘贴苹果/小宇宙单集链接；助眠：点关键词搜索，或粘贴助眠音频直链。</span></div>
+      <div class="guide-step"><span class="guide-num">2</span><span>顶部「上传」里切换「音乐」或「播客」。</span></div>
+      <div class="guide-step"><span class="guide-num">3</span><span>音乐走 B 站，可搜音乐、评书、戏曲、播客、助眠；播客走苹果播客，可搜索节目并选单集，也支持小宇宙单集链接。两类都支持音频直链。</span></div>
       <div class="guide-step"><span class="guide-num">4</span><span>点「上传」后，进度和结果会显示在下方；完成后可在「音乐云盘」和上传记录里查看，点云盘歌曲右侧「收藏」可放进任意自建歌单。</span></div>
       <div class="guide-tip">单个文件超过 200MB 时会询问是否拆分上传，拆分后文件名会自动带（序号/总段数）。</div>
     </div>
@@ -3354,7 +3373,7 @@ function toggleManual(){ $('manualBox').hidden = !$('manualBox').hidden; }
 function toggleMore(){ $('more').classList.toggle('open'); }
 function focusInput(){ $('input').focus(); }
 
-// 导航两级: 一级 补歌/上传; 上传下二级 音乐/播客/助眠. 进度与历史共用
+// 导航两级: 一级 补歌/上传; 上传下二级 音乐(B站)/播客(苹果·小宇宙). 进度与历史共用
 let curTab = 'fix', curType = 'music';
 function switchTab(t) {
   const next = t === 'up' ? 'up' : 'fix';
@@ -3373,7 +3392,7 @@ function switchTab(t) {
   if (changed) window.scrollTo(0, 0);
 }
 function switchType(t) {
-  curType = (t === 'pod' || t === 'sleep') ? t : 'music';
+  curType = t === 'pod' ? 'pod' : 'music';
   try { localStorage.setItem('bili2ncm.type', curType); } catch (e) {}
   document.querySelectorAll('.seg-btn').forEach(b => b.classList.toggle('on', b.dataset.type === curType));
   resetSearchState();
@@ -3388,22 +3407,13 @@ function applyType() {
   const t = curType;
   $('input').placeholder = t === 'pod'
     ? '粘贴苹果播客单集链接（或小宇宙单集链接），多个用逗号分隔'
-    : t === 'sleep'
-      ? '粘贴助眠音频直链（mp3/m4a），或搜索助眠节目'
-      : '粘贴 B 站视频/合集页链接、音频直链或 BV 号，多个用逗号分隔';
+    : '粘贴 B 站视频/合集页链接、音频直链或 BV 号，多个用逗号分隔';
   $('seasonWrap').hidden = t !== 'music';
-  $('podHint').hidden = t === 'music';
-  $('podHint').textContent = t === 'sleep'
-    ? '可粘贴音频直链（.mp3/.m4a 等），或点上方关键词搜索助眠节目；超过 200MB 会先询问是否拆分成多个文件。'
-    : '粘贴苹果播客单集链接（podcasts.apple.com/…?i=…），小宇宙单集链接仍可用；超过 200MB 会先询问是否拆分成多个文件。';
-  $('sleepChips').hidden = t !== 'sleep';
   $('skw').placeholder = t === 'pod'
     ? '搜索苹果播客节目，如：故事FM、忽左忽右…'
-    : t === 'sleep'
-      ? '搜索助眠节目，如：雨声、白噪音、ASMR…'
-      : '搜索 B 站歌曲/翻唱/演唱会…';
+    : '搜索 B 站音乐/评书/戏曲/播客/助眠…';
   $('searchHint').textContent = t === 'music'
-    ? '输入歌名后点「搜索」，结果会显示在这里，可与右侧云盘对照'
+    ? '输入关键词后点「搜索」，B 站里的音乐、评书、戏曲、播客、助眠都可以搜；右侧可对照云盘'
     : '搜索节目后点「看单集」，再选具体单集上传；右侧可对照云盘已有歌曲';
   setSplit(true);
 }
@@ -3587,6 +3597,28 @@ function restoreForm() {
 }
 // 空状态带行动 / 加载失败可重试 / grid 行布局
 let cloudSongs = [], cloudLoaded = false;
+// 云盘批量收藏: 进入选择模式后逐首勾选, 统一收藏到自建歌单
+let batchMode = false;
+const batchSel = new Set();
+function toggleBatch() {
+  batchMode = !batchMode;
+  batchSel.clear();
+  $('batchBar').hidden = !batchMode;
+  $('batchBtn').textContent = batchMode ? '取消批量' : '批量收藏';
+  $('batchCount').textContent = '已选 0 首';
+  loadList();
+}
+function toggleSong(id) {
+  const k = String(id);
+  if (batchSel.has(k)) batchSel.delete(k); else batchSel.add(k);
+  $('batchCount').textContent = '已选 ' + batchSel.size + ' 首';
+}
+function selectAllCloud(on) {
+  batchSel.clear();
+  if (on) cloudSongs.forEach(s => batchSel.add(String(s.songId)));
+  $('batchCount').textContent = '已选 ' + batchSel.size + ' 首';
+  loadList();
+}
 async function loadList() {
   const box = $('list');
   try {
@@ -3598,8 +3630,11 @@ async function loadList() {
     if (searchMode) refreshSearchDup();
     if (!j.songs.length) { box.innerHTML = '<div class="empty">云盘还是空的<br><button onclick="focusInput()">去上传第一首</button></div>'; return; }
     box.innerHTML = j.songs.map(s =>
-      '<div class="song"><div class="s-name">' + esc(s.name) + '</div><div class="s-artist">' + esc(s.artist) + '</div>'
-      + '<div class="s-meta">' + (s.bitrate ? Math.round(s.bitrate/1000)+'kbps' : '-') + ' · ' + (s.size ? (s.size/1048576).toFixed(1)+'MB' : '-') + '</div>'
+      '<div class="song"><div class="s-name">'
+      + (batchMode ? '<input type="checkbox" class="batch-chk" data-id="' + s.songId + '"' + (batchSel.has(String(s.songId)) ? ' checked' : '') + '>' : '')
+      + esc(s.name) + '</div><div class="s-artist">' + esc(s.artist) + '</div>'
+      + '<div class="s-meta">' + (s.bitrate ? Math.round(s.bitrate / 1000) + 'kbps · ' : '')
+      + (s.size ? (s.size / 1048576).toFixed(1) + 'MB' : '-') + '</div>'
       + '<div class="s-acts"><button class="s-fav" data-id="' + s.songId + '" data-name="' + esc(s.name) + '">收藏</button>'
       + '<button class="s-del" data-id="' + s.songId + '" data-name="' + esc(s.name) + '">删除</button></div></div>').join('');
   } catch (e) {
@@ -3607,14 +3642,16 @@ async function loadList() {
   }
 }
 $('list').addEventListener('click', e => {
+  const chk = e.target.closest('.batch-chk');
+  if (chk) { toggleSong(chk.dataset.id); return; }
   const fav = e.target.closest('.s-fav');
   if (fav) { openFav({ songId: Number(fav.dataset.id), name: fav.dataset.name }); return; }
   const b = e.target.closest('.s-del'); if (!b) return;
   if (!confirm('确定从云盘删除《' + b.dataset.name + '》?')) return;
   fetch('/api/del', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({songId:+b.dataset.id}) }).then(loadList);
 });
-// 云盘歌曲收藏到指定歌单(默认「我喜欢的音乐」)
-let favSong = null, plCache = null;
+// 云盘歌曲收藏到指定歌单(默认「我喜欢的音乐」), 支持单首与批量
+let favIds = [], plCache = null;
 async function getPlaylistCache() {
   if (plCache) return plCache;
   const j = await (await fetch('/api/playlists')).json();
@@ -3622,9 +3659,11 @@ async function getPlaylistCache() {
   plCache = j.playlists || [];
   return plCache;
 }
-async function openFav(song) {
-  favSong = song;
-  $('favTitle').textContent = '收藏《' + song.name + '》到歌单';
+async function openFav(song, ids) {
+  favIds = Array.isArray(ids) && ids.length ? ids.slice() : (song ? [song.songId] : []);
+  if (!favIds.length) return;
+  $('favTitle').textContent = song ? '收藏《' + song.name + '》到歌单' : '收藏 ' + favIds.length + ' 首到歌单';
+  $('favSub').textContent = song ? '选择要收藏到的歌单，默认「我喜欢的音乐」。' : '已选 ' + favIds.length + ' 首，选择要收藏到的自建歌单。';
   $('favPl').innerHTML = '<option>读取歌单中…</option>';
   $('favModal').hidden = false;
   lockScroll();
@@ -3638,9 +3677,13 @@ async function openFav(song) {
     $('favPl').innerHTML = '<option value="">' + esc(e.message) + '</option>';
   }
 }
-function closeFav() { $('favModal').hidden = true; favSong = null; lockScroll(); }
+function openBatchFav() {
+  if (!batchSel.size) { toast('请先勾选要收藏的歌曲'); return; }
+  openFav(null, Array.from(batchSel).map(Number));
+}
+function closeFav() { $('favModal').hidden = true; favIds = []; lockScroll(); }
 async function confirmFav() {
-  if (!favSong) return;
+  if (!favIds.length) return;
   const pid = Number($('favPl').value);
   if (!pid) { toast('请先选择歌单'); return; }
   const btn = $('favYes');
@@ -3648,12 +3691,14 @@ async function confirmFav() {
   try {
     const j = await (await fetch('/api/playlist/tracks', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ op: 'add', pid, ids: [favSong.songId] }),
+      body: JSON.stringify({ op: 'add', pid, ids: favIds }),
     })).json();
     if (!j.ok) throw new Error(j.error || '收藏失败');
     const hit = (plCache || []).find(p => String(p.id) === String(pid));
-    toast('已收藏到「' + (hit ? hit.name : '歌单') + '」');
+    toast('已收藏 ' + favIds.length + ' 首到「' + (hit ? hit.name : '歌单') + '」');
+    const wasBatch = batchMode;
     closeFav();
+    if (wasBatch) toggleBatch();
   } catch (e) {
     alert('收藏失败: ' + e.message);
   }
@@ -4306,15 +4351,50 @@ async function findSources(row, btn) {
     btn.disabled = false; btn.textContent = '找音源';
   }
 }
-let listenBv = '';
+let listenBv = '', listenPage = 1;
+const qPages = Object.create(null);
+// 多P视频试听定位: 按搜索词匹配分P名, 匹配不到再回退第1P
+function pickPreviewPage(pages, q) {
+  if (!Array.isArray(pages) || pages.length <= 1) return 1;
+  const nq = normName(q);
+  if (!nq) return 1;
+  let best = 1, bestScore = 0;
+  for (const p of pages) {
+    const np = normName(p.part);
+    if (!np) continue;
+    let score = 0;
+    if (np === nq) score = 100;
+    else if (np.includes(nq)) score = 80 - Math.min(40, np.length - nq.length);
+    else if (nq.includes(np) && np.length >= 2) score = 60 - Math.min(40, nq.length - np.length);
+    if (score > bestScore) { bestScore = score; best = p.page; }
+  }
+  return bestScore > 0 ? best : 1;
+}
 function openListen(bvid, song, title) {
   listenBv = bvid;
+  listenPage = 1;
   $('listenTitle').textContent = song || title || '试听';
   $('listenSub').textContent = song ? (title || '') : '';
   $('listenSub').hidden = !$('listenSub').textContent;
-  $('listenFrame').src = 'https://player.bilibili.com/player.html?bvid=' + encodeURIComponent(bvid) + '&page=1&autoplay=1&danmaku=0&high_quality=1';
   $('listenModal').hidden = false;
   lockScroll();
+  const q = String(song || $('skw').value || '').trim();
+  const show = pages => {
+    listenPage = pickPreviewPage(pages, q);
+    $('listenFrame').src = 'https://player.bilibili.com/player.html?bvid=' + encodeURIComponent(bvid)
+      + '&page=' + listenPage + '&autoplay=1&danmaku=0&high_quality=1';
+  };
+  if (qPages[bvid]) return show(qPages[bvid]);
+  // 分P信息尚未探测到: 补查一次(后端有缓存, 通常秒回)
+  $('listenFrame').src = 'about:blank';
+  fetch('/api/quality?bvids=' + encodeURIComponent(bvid))
+    .then(r => r.json())
+    .then(j => {
+      const it = (j.items || [])[0];
+      if (it && it.pages) qPages[bvid] = it.pages;
+      show(qPages[bvid] || []);
+    })
+    .catch(() => show([]));
 }
 function closeListen() {
   $('listenModal').hidden = true;
@@ -4322,7 +4402,8 @@ function closeListen() {
   lockScroll();
 }
 function openBili() {
-  if (listenBv) window.open('https://www.bilibili.com/video/' + encodeURIComponent(listenBv), '_blank', 'noopener');
+  if (listenBv) window.open('https://www.bilibili.com/video/' + encodeURIComponent(listenBv)
+    + (listenPage > 1 ? '?p=' + listenPage : ''), '_blank', 'noopener');
 }
 // 点击弹窗外部收起
 $('listenModal').addEventListener('click', e => { if (e.target === $('listenModal')) closeListen(); });
@@ -4473,7 +4554,7 @@ $('srcModal').addEventListener('click', e => {
   else if (act === 'qr') { closeSrc(); showQr('bili'); }
   else if (act === 'pop') { closeSrc(); popSearch(b.dataset.kw); }
 });
-// 搜索结果: 音乐=B站视频, 播客/助眠=苹果播客节目与单集
+// 搜索结果: 音乐=B站视频, 播客=苹果播客节目与单集
 let searchItems = [], searchMode = '', appleShows = [], appleEps = [], appleShowName = '';
 function normName(s){
   let out = '';
@@ -4508,17 +4589,18 @@ function renderSearch() {
   const box = $('sres');
   const total = searchItems.length;
   const dup = searchItems.filter(v => v.cloud).length;
-  const list = searchItems;
+  const list = searchItems.slice().sort((a, b) => (b.score || 0) - (a.score || 0) || (b.play || 0) - (a.play || 0));
   setSplit(true);
-  const head = '<div class="sr-head"><span>找到 ' + total + ' 首' + (dup ? ' · 云盘已有 ' + dup + ' 首' : '')
-    + '</span></div>';
+  const head = '<div class="sr-head"><span>找到 ' + total + ' 首' + (dup ? ' · 云盘已有 ' + dup + ' 首' : '') + '</span></div>';
   if (!list.length) {
     box.innerHTML = head + '<div class="empty">' + (total ? '这些歌云盘里都已经有了' : '没有找到相关内容')
       + '<br><button class="mini" data-act="pop">在页面内搜B站</button></div>';
     return;
   }
   box.innerHTML = head + list.map(v =>
-    '<div class="sr"><div class="sr-l"><div class="sr-t">' + esc(v.title) + (v.cloud ? '<span class="badge">云盘已有</span>' : '') + '</div>'
+    '<div class="sr"><div class="sr-l"><div class="sr-t">' + esc(v.title)
+    + (v.label ? '<span class="qtag ' + (v.tier || 'q64') + '" title="' + esc(v.detail || '') + '">' + esc(v.label) + '</span>' : '')
+    + (v.cloud ? '<span class="badge">云盘已有</span>' : '') + '</div>'
     + '<div class="sr-m">' + esc(v.author) + ' · ' + esc(v.duration) + ' · ' + fmtPlay(v.play) + '次播放</div></div>'
     + '<div class="sr-a"><button class="mini" data-act="preview" data-bv="' + esc(v.bvid) + '" data-title="' + esc(v.title) + '">试听</button>'
     + '<button class="mini' + (v.cloud ? '' : ' primary') + '" data-act="upload" data-bv="' + esc(v.bvid) + '">'
@@ -4562,13 +4644,31 @@ async function doBiliSearch() {
   $('searchHint').hidden = true;
   searchMode = 'bili';
   if (!biliLogged) { showBiliLoginPrompt(box); return; }
-  box.innerHTML = '<div class="empty">搜索中...</div>';
+  box.innerHTML = '<div class="empty">搜索并检测音质中…</div>';
   try {
     if (!cloudLoaded) await loadList();
     const j = await (await fetch('/api/search?kw=' + encodeURIComponent(kw))).json();
     if (j.needLogin) { showBiliLoginPrompt(box); return; }
     if (j.error) { searchItems = []; box.innerHTML = '<div class="empty">B站登录可能已过期 <button class="mini" data-act="qr">扫码登录B站</button> <button class="mini" data-act="pop">在页面内搜B站</button></div>'; return; }
-    searchItems = (j.items || []).map(v => Object.assign({}, v, { cloud: !!cloudMatch(v.title) }));
+    const items = j.items || [];
+    // 先补齐音质与分P信息, 再一次性渲染; 保证结果出来时就带音质标签, 也可直接按音质排序
+    let qmap = {};
+    if (items.length) {
+      try {
+        const qj = await (await fetch('/api/quality?bvids=' + encodeURIComponent(items.map(v => v.bvid).join(',')))).json();
+        (qj.items || []).forEach(q => {
+          qmap[q.bvid] = q;
+          if (q.pages) qPages[q.bvid] = q.pages;
+        });
+      } catch (e) { /* 音质探测失败不影响搜索 */ }
+    }
+    searchItems = items.map(v => {
+      const q = qmap[v.bvid] || {};
+      return Object.assign({}, v, {
+        cloud: !!cloudMatch(v.title),
+        label: q.label, tier: q.tier, score: q.score, detail: q.detail,
+      });
+    });
     renderSearch();
   } catch (e) {
     searchItems = [];
@@ -4629,11 +4729,6 @@ $('sres').addEventListener('click', e => {
   else if (act === 'epup') { $('input').value = b.dataset.link; doUpload(); }
   else if (act === 'qr') showQr('bili');
   else if (act === 'pop') popSearch();
-});
-$('sleepChips').addEventListener('click', e => {
-  const c = e.target.closest('.chip'); if (!c) return;
-  $('skw').value = c.dataset.kw;
-  doSearch();
 });
 function fmtPlay(n) { return n >= 10000 ? (n / 10000).toFixed(1) + '万' : String(n); }
 // 左右对照: 有搜索结果时把搜索框与音乐云盘并排, 同时查看已有哪些歌
@@ -4760,7 +4855,7 @@ restoreForm(); loadStatus(); loadList(); loadHistory();
 try {
   const savedTab = localStorage.getItem('bili2ncm.tab') || 'fix';
   const savedType = localStorage.getItem('bili2ncm.type');
-  curType = (savedType === 'pod' || savedType === 'sleep') ? savedType : 'music';
+  curType = savedType === 'pod' ? 'pod' : 'music';
   switchTab(savedTab === 'fix' ? 'fix' : 'up');
   switchType(curType);
 } catch (e) { switchTab('fix'); }
@@ -5182,6 +5277,57 @@ async function biliSearch(kw) {
     duration: v.duration || '',
     play: v.play || 0,
   }));
+}
+// 音质探测: 搜索结果按 bvid 懒加载, 读取 dash 音频流实际码率; 会话内缓存避免重复请求
+const Q_CACHE = new Map();
+const Q_TIERS = {
+  30251: ['Hi-Res', 'hires', 95],
+  30280: ['192K', 'q192', 85],
+  30232: ['132K', 'q132', 70],
+  30216: ['64K', 'q64', 50],
+};
+function qualityLabel(a) {
+  const t = Q_TIERS[a.id];
+  const kbps = Math.round(a.bandwidth / 1000);
+  const detail = '实测 ' + kbps + ' kbps';
+  if (t) return { label: t[0], tier: t[1], score: t[2], detail };
+  return { label: kbps + 'K', tier: kbps >= 128 ? 'q132' : 'q64', score: kbps >= 128 ? 65 : 50, detail };
+}
+async function biliQuality(bvid) {
+  if (Q_CACHE.has(bvid)) return Q_CACHE.get(bvid);
+  const H = await biliHeaders();
+  const view = await getJSON('https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid), H, 15000);
+  if (view.code !== 0) throw new Error(view.message || '视频信息获取失败');
+  const cid = view.data && view.data.cid;
+  if (!cid) throw new Error('缺少 cid');
+  const pj = await getJSON('https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid)
+    + '&cid=' + cid + '&fnval=16&fnver=0&qn=0', H, 15000);
+  if (pj.code !== 0 || !pj.data || !pj.data.dash) throw new Error(pj.message || '无音频流');
+  // 30250=杜比全景声, 云盘不支持, 不参与音质评价
+  const audios = (pj.data.dash.audio || []).filter(a => a.id !== 30250).sort((a, b) => b.bandwidth - a.bandwidth);
+  if (!audios.length) throw new Error('无音频流');
+  const out = {
+    ...qualityLabel(audios[0]),
+    // 附带分P列表, 前端试听时用来定位到正确的分P (多P/合集视频默认page=1会播错歌)
+    pages: (view.data.pages || []).map(p => ({ page: p.page, part: p.part || '', duration: p.duration || 0 })),
+  };
+  if (Q_CACHE.size > 300) Q_CACHE.clear();
+  Q_CACHE.set(bvid, out);
+  return out;
+}
+// 并发限制 3, 避免一次搜索打出几十个请求触发 B站风控
+async function biliQualityBatch(bvids) {
+  const out = [];
+  let i = 0;
+  async function worker() {
+    while (i < bvids.length) {
+      const bvid = bvids[i++];
+      try { out.push({ bvid, ...(await biliQuality(bvid)) }); }
+      catch (e) { out.push({ bvid, error: true }); }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(3, bvids.length) }, worker));
+  return out;
 }
 
 // ---------- 二维码本地生成 (byte模式, ECC M/L, 版本1-6, 掩码0; 登录链接不出本机) ----------
@@ -5759,6 +5905,17 @@ http.createServer((rq, rs) => {
       } catch (e) {
         rs.end(JSON.stringify({ items: [], error: e.message }));
       }
+    })();
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/quality') {
+    const bvids = (new URL(rq.url, 'http://x').searchParams.get('bvids') || '').split(',')
+      .map(s => s.trim()).filter(s => /^BV[0-9A-Za-z]{10}$/.test(s)).slice(0, 20);
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    if (!bvids.length) return rs.end(JSON.stringify({ items: [] }));
+    (async () => {
+      try { rs.end(JSON.stringify({ items: await biliQualityBatch(bvids) })); }
+      catch (e) { rs.end(JSON.stringify({ items: [], error: e.message })); }
     })();
     return;
   }
