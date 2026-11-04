@@ -71,7 +71,7 @@ function createWindow() {
     skipTaskbar: true,
     alwaysOnTop: true,
     show: false,
-    title: '网易云ICU 桌面歌词',
+    title: 'GraySongICU 桌面歌词',
     icon: path.join(__dirname, 'icon.png'),
     webPreferences: {
       backgroundThrottling: false,
@@ -97,7 +97,7 @@ function createWindow() {
 function createTray() {
   try {
     tray = new Tray(path.join(__dirname, 'icon.png'));
-    tray.setToolTip('网易云ICU 桌面歌词');
+    tray.setToolTip('GraySongICU 桌面歌词');
     tray.on('click', () => {
       applyLock(false);
       if (win && !win.isDestroyed()) win.showInactive();
@@ -139,7 +139,7 @@ if (!app.requestSingleInstanceLock()) {
   ipcMain.on('lyric:drag-end', endDrag);
 
   app.whenReady().then(() => {
-    app.setAppUserModelId('com.grayicu.lyric');
+    app.setAppUserModelId('com.graysongicu.lyric');
     createWindow();
     createTray();
     // 锁定时窗口鼠标穿透，快捷键只作为备用（避开网易云 Ctrl+Alt+L 的"我喜欢"）

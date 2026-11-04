@@ -1,4 +1,4 @@
-# bili2ncm
+# GraySongICU
 
 **B站音频 → 网易云音乐云盘** · 单文件 · 零依赖 · 基于客户端 eapi 协议
 
@@ -83,7 +83,7 @@ A: 多 P 批量上传时内置了 5 秒间隔保护，入库失败（频率限�
 ## 目录结构
 
 ```
-bili2ncm/
+GraySongICU/
 ├── server.js            # 全部代码 (服务 + 协议实现 + 前端页面)
 ├── cookie.txt           # 网易云cookie (gitignore, 首次在页面保存)
 ├── bilibili_cookie.txt  # B站cookie (gitignore, 可选)

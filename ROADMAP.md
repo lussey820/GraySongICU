@@ -1,4 +1,4 @@
-# bili2ncm 定位与目标
+# GraySongICU 定位与目标
 
 > 本文档定义项目定位、当前进度与演进路线，作为开发的北极星。
 > 每次大改动前先对照：这个改动是否在定位内？
@@ -18,7 +18,7 @@
 
 ### 与同类项目的差异
 
-| | Melody | NeteaseCloudMusicApi 系 | bili2ncm |
+| | Melody | NeteaseCloudMusicApi 系 | GraySongICU |
 |---|---|---|---|
 | 协议 | weapi（已失效⚠️） | weapi（已失效⚠️） | **eapi（现行✅）** |
 | 依赖 | Node+FFmpeg+npm | npm 全家桶 | **零依赖单文件** |
@@ -50,7 +50,7 @@
 - [x] 入库失败自动重试（uploadStatus:9 为频率限制/同步延迟，5秒重试 100% 恢复）
 - [x] 单P失败不中断批量 + 结束汇总（成功 X/Y）
 - [x] 客户端中途断开保护（send 写失败静默，任务跑完不炸）
-- [x] GitHub 私有仓库已推送（lussey820/bili2ncm）
+- [x] GitHub 私有仓库已推送
 
 ### 关键实测发现
 
