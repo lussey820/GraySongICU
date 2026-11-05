@@ -12,16 +12,21 @@ const path = require('path');
 const { execFile, spawn } = require('child_process');
 const os = require('os');
 
-const PORT = 3210;
+const PORT = Number(process.env.GRAYSONGICU_PORT) || 3210;
 const HOST = '127.0.0.1';
 const EAPI_KEY = Buffer.from('e82ckenh8dichen8');
 const BUCKET = 'jd-musicrep-privatecloud-audio-public';
 // 实测(2026-10-22): 云盘存储层单文件上限 200MB, 200MB+1KB 即返回 413
 const MAX_CLOUD_BYTES = 200 * 1024 * 1024;
+// 留声机: 本地上传的封面暂存, 10 分钟内有效
+const localCovers = new Map();
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0';
 const NCM_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) NeteaseMusicDesktop/3.1.10.203506';
 
-const DIR = __dirname;
+// APP_DIR = 程序资源目录(只读), DIR = 用户数据目录(可写)
+// 打包后数据写到 %APPDATA%\GraySongICU, 避免 Program Files 无写权限
+const APP_DIR = process.env.GRAYSONGICU_APP_DIR || __dirname;
+const DIR = process.env.GRAYSONGICU_DATA_DIR || __dirname;
 // cookie 兼容: 项目目录优先, 其次上级目录 (便于从旧脚本迁移)
 function cookieFile(name) {
   if (fs.existsSync(path.join(DIR, name))) return path.join(DIR, name);
@@ -94,6 +99,7 @@ async function appleEpisodes(collectionId) {
     durationMs: Number(r.trackTimeMillis || 0),
     date: r.releaseDate || '',
     url: r.episodeUrl,
+    artwork: r.artworkUrl600 || r.artworkUrl100 || '',
     link: 'https://podcasts.apple.com/cn/podcast/id' + (r.collectionId || collectionId) + (r.trackId ? '?i=' + r.trackId : ''),
   }));
 }
@@ -146,6 +152,57 @@ function appendHistory(entry) {
     list.unshift({ time: nowStamp(), ...entry });
     fs.writeFileSync(HISTORY_FILE, JSON.stringify(list.slice(0, 500), null, 2));
   } catch (e) { /* 历史写失败不影响上传 */ }
+}
+
+// ---------- 统一异常处理 ----------
+// 原则: 技术细节只写服务端日志, 返回给页面的一律是人话
+function rawErrorText(e) {
+  if (typeof e === 'string') return e;
+  if (!e) return '未知错误';
+  return String(e.stack || e.message || e);
+}
+function friendlyError(e) {
+  const msg = String((e && e.message) || e || '').trim();
+  const code = String((e && e.code) || '');
+  const status = Number((e && (e.statusCode || e.status)) || 0);
+  const all = (msg + ' ' + code + ' ' + (status || '')).trim();
+  if (e && e.authFail) return '登录已过期, 请重新登录网易云后再试。';
+  if (/301|凭证.{0,6}(失效|无效)|MUSIC_U.{0,6}(失效|过期)|重新粘贴|登录已?(失效|过期)/i.test(msg)) return '登录已过期, 请重新登录网易云后再试。';
+  if (/-101|-352|SESSDATA|B站登录|B 站登录/i.test(msg)) return 'B 站登录信息已失效, 请重新登录 B 站。';
+  if (/-412|风控|请求过于频繁|操作太频繁|频率/i.test(msg)) return '操作太快了, 请稍等一会儿再试。';
+  if (/413|too large|payload too large|超过.{0,8}(200|上限)|文件过[大超]/i.test(all)) return '文件超过云盘上限, 请拆分后再传。';
+  if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|getaddrinfo|socket hang up|连接超时|网络|连接失败/i.test(all)) {
+    if (/ETIMEDOUT|连接超时|请求超时|timeout/i.test(all)) return '请求超时, 请稍后重试。';
+    return '网络连接失败, 请检查网络后重试。';
+  }
+  if (/超时|timeout/i.test(all)) return '请求超时, 请稍后重试。';
+  if (/未配置.{0,6}cookie|未登录|请先登录/i.test(msg)) return '还没有登录, 请先完成登录。';
+  if (/非JSON|Unexpected token|JSON.{0,3}parse|返回格式|格式异常/i.test(msg)) return '服务返回的数据无法识别, 请稍后重试。';
+  if (/ffmpeg|转码/i.test(msg)) return '音频转换失败, 请换一个音源试试。';
+  if (/ffprobe|读取音频|音频时[长间]/i.test(msg)) return '音频文件无法读取, 请换一个音源试试。';
+  if (/没有可用音频|无可用音频|未找到可用音频|没有音频/i.test(msg)) return '这个视频没有可用音频, 换一个试试。';
+  if (/视频不存在|稿件.{0,6}(不可见|删除)|已删除|已下架/i.test(msg)) return '视频不存在或已下架, 换一个试试。';
+  if (/视频信息.{0,6}(获取|读取)失败/i.test(msg)) return '视频信息读取失败, 请稍后重试。';
+  if (/ENOENT|EPERM|EACCES|写入失败|临时文件/i.test(msg)) return '本地文件读写失败, 请检查目录权限后重试。';
+  if (/无法解析.{0,6}(BV号|链接)|链接格式/i.test(msg)) return '链接无法识别, 请检查后重试。';
+  if (/合集为空/i.test(msg)) return '这个合集是空的, 换一个试试。';
+  // 已经是中文人话, 且没有明显技术痕迹 → 原样展示
+  if (/[\u4e00-\u9fa5]/.test(msg) && !/[A-Za-z_]{6,}|\[object|undefined|null|HTTP|status|code|stack|Error:/i.test(msg)) return msg;
+  return '操作失败, 请稍后重试。';
+}
+function logError(scope, e) {
+  const detail = rawErrorText(e);
+  console.error('[' + nowStamp() + '][' + scope + '] ' + (detail.split('\n')[0] || '未知错误'));
+  if (e && e.stack && e.stack !== detail) console.error(e.stack);
+}
+function fail(rs, e, extra, status) {
+  logError('api', e);
+  try {
+    if (!rs.headersSent) {
+      rs.writeHead(status || 200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    }
+    if (!rs.writableEnded) rs.end(JSON.stringify(Object.assign({ ok: false, error: friendlyError(e) }, extra || {})));
+  } catch (_) { /* 连接已断开, 忽略 */ }
 }
 
 // ---------- 网易云 eapi ----------
@@ -485,7 +542,12 @@ async function editPlaylistTracks({ op, pid, ids }) {
 }
 
 // 上传一个音频文件(Buffer)到云盘, 返回 songId
-async function uploadBuffer({ buffer, ext, filename, song, artist, album, contentType, send }) {
+async function uploadBuffer({ buffer, ext, filename, song, artist, album, contentType, send, cover }) {
+  if (cover) {
+    const before = buffer.length;
+    buffer = embedCover(buffer, ext, cover, { title: song, artist, album });
+    if (buffer.length > before) send('已写入歌曲封面');
+  }
   const md5 = crypto.createHash('md5').update(buffer).digest('hex');
   send(`正在准备上传 (大小 ${(buffer.length / 1048576).toFixed(2)}MB)...`);
   const check = await ncmReq('/api/cloud/upload/check', {
@@ -644,6 +706,169 @@ function mp4Box(type, payload) {
   h.write(type, 4, 'latin1');
   return Buffer.concat([h, payload]);
 }
+
+// ---------- 上传前写入封面: mp3 写 ID3 APIC, m4a 写 moov/udta/meta/ilst 的 covr ----------
+function id3SyncSafe(n) {
+  return Buffer.from([(n >> 21) & 0x7f, (n >> 14) & 0x7f, (n >> 7) & 0x7f, n & 0x7f]);
+}
+function id3Frame(id, payload) {
+  const h = Buffer.alloc(10);
+  h.write(id, 0, 'latin1');
+  h.writeUInt32BE(payload.length, 4);
+  return Buffer.concat([h, payload]);
+}
+function id3TextFrame(id, text) {
+  const t = Buffer.from(String(text), 'utf16le');
+  const bom = Buffer.from([0xff, 0xfe]);
+  return id3Frame(id, Buffer.concat([Buffer.from([1]), bom, t]));
+}
+function embedMp3Cover(buf, cover, mime, meta) {
+  const frames = [];
+  if (meta.title) frames.push(id3TextFrame('TIT2', meta.title));
+  if (meta.artist) frames.push(id3TextFrame('TPE1', meta.artist));
+  if (meta.album) frames.push(id3TextFrame('TALB', meta.album));
+  // APIC: 编码(0=latin1) + mime + 0 + 图片类型(3=封面) + 描述 + 0 + 图片数据
+  const apic = Buffer.concat([
+    Buffer.from([0]), Buffer.from(mime, 'latin1'), Buffer.from([0]),
+    Buffer.from([3]), Buffer.from([0]), cover,
+  ]);
+  frames.push(id3Frame('APIC', apic));
+  const body = Buffer.concat(frames);
+  const head = Buffer.concat([
+    Buffer.from('ID3', 'latin1'), Buffer.from([3, 0, 0]), id3SyncSafe(body.length),
+  ]);
+  let rest = buf;
+  if (buf.toString('latin1', 0, 3) === 'ID3') {
+    const flags = buf[5] || 0;
+    const size = ((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14)
+      | ((buf[8] & 0x7f) << 7) | (buf[9] & 0x7f);
+    let end = 10 + size;
+    if (flags & 0x10) end += 10; // 带 footer
+    rest = buf.subarray(Math.min(end, buf.length));
+  }
+  return Buffer.concat([head, body, rest]);
+}
+function mp4DataBox(type, payload) {
+  return mp4Box('data', Buffer.concat([Buffer.from([0, 0, 0, type, 0, 0, 0, 0]), payload]));
+}
+function mp4TextAtom(name, text) {
+  return mp4Box(name, mp4DataBox(1, Buffer.from(String(text), 'utf8')));
+}
+function mp4AddCover(buf, cover, mime, meta) {
+  const top = mp4Parse(buf, 0, buf.length);
+  const ftyp = mp4Find(top, 'ftyp');
+  const moov = mp4Find(top, 'moov');
+  const mdat = mp4Find(top, 'mdat');
+  if (!ftyp || !moov || !mdat || !moov.children) return null;
+  // 分片 MP4 的样本偏移在 moof 里, 直接插入会破坏结构, 放弃写封面
+  const stbl0 = mp4FindPath(moov.children, 'trak', 'mdia', 'minf', 'stbl');
+  if (!stbl0 || (!mp4Find(stbl0.children, 'stco') && !mp4Find(stbl0.children, 'co64'))) return null;
+
+  const hdlr = mp4Box('hdlr', Buffer.concat([
+    Buffer.from([0, 0, 0, 0, 0, 0, 0, 0]), Buffer.from('mdir', 'latin1'), Buffer.alloc(12),
+  ]));
+  const items = [];
+  if (meta.title) items.push(mp4TextAtom('\u00a9nam', meta.title));
+  if (meta.artist) items.push(mp4TextAtom('\u00a9ART', meta.artist));
+  if (meta.album) items.push(mp4TextAtom('\u00a9alb', meta.album));
+  items.push(mp4Box('covr', mp4DataBox(mime === 'image/png' ? 14 : 13, cover)));
+  const metaBox = mp4Box('meta', Buffer.concat([
+    Buffer.from([0, 0, 0, 0]), hdlr, mp4Box('ilst', Buffer.concat(items)),
+  ]));
+  const udta = mp4Box('udta', metaBox);
+
+  const kids = moov.children.filter(n => n.type !== 'udta');
+  const moovPayload = Buffer.concat([...kids.map(n => buf.subarray(n.start, n.end)), udta]);
+  const newMoov = mp4Box('moov', moovPayload);
+  const delta = newMoov.length - moov.size;
+
+  // moov 在 mdat 之前时, 插入内容会把音频数据整体后移, 需要同步修正 chunk 偏移
+  if (delta !== 0 && mdat.start > moov.start) {
+    const nodes = mp4Parse(newMoov, 0, newMoov.length);
+    const stbl = mp4FindPath(nodes, 'moov', 'trak', 'mdia', 'minf', 'stbl');
+    const stco = stbl && mp4Find(stbl.children, 'stco');
+    if (stco) {
+      const p = stco.start + stco.header;
+      const n = newMoov.readUInt32BE(p + 4);
+      for (let i = 0; i < n; i++) {
+        const at = p + 8 + i * 4;
+        newMoov.writeUInt32BE(newMoov.readUInt32BE(at) + delta, at);
+      }
+    }
+    const co64 = stbl && mp4Find(stbl.children, 'co64');
+    if (co64) {
+      const p = co64.start + co64.header;
+      const n = newMoov.readUInt32BE(p + 4);
+      const d = BigInt(delta);
+      for (let i = 0; i < n; i++) {
+        const at = p + 8 + i * 8;
+        newMoov.writeBigUInt64BE(newMoov.readBigUInt64BE(at) + d, at);
+      }
+    }
+  }
+
+  const out = [];
+  for (const n of top) out.push(n.type === 'moov' ? newMoov : buf.subarray(n.start, n.end));
+  return Buffer.concat(out);
+}
+function imageMime(buf) {
+  if (!buf || buf.length < 4) return '';
+  if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg';
+  if (buf.readUInt32BE(0) === 0x89504e47) return 'image/png';
+  return '';
+}
+function embedCover(buf, ext, cover, meta) {
+  if (!cover || !cover.buffer) return buf;
+  try {
+    if (ext === 'mp3') return embedMp3Cover(buf, cover.buffer, cover.mime, meta);
+    if (ext === 'm4a') return mp4AddCover(buf, cover.buffer, cover.mime, meta) || buf;
+  } catch (e) {
+    logError('cover', e);
+  }
+  return buf;
+}
+
+// ---------- 封面: 解析用户选的图片 / 按歌名找图 ----------
+const COVER_MAX_BYTES = 5 * 1024 * 1024;
+async function fetchCoverBuffer(url, referer) {
+  const u = new URL(url);
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('图片地址不支持');
+  if (isPrivateHost(u.hostname)) throw new Error('图片地址不支持');
+  const buf = await req('GET', url, {
+    'User-Agent': UA, 'Referer': referer || 'https://image.baidu.com/',
+  }, null, true, 20000);
+  if (buf.length > COVER_MAX_BYTES) throw new Error('图片太大, 请换一张小于 5MB 的');
+  if (!imageMime(buf)) throw new Error('只支持 JPG / PNG 图片');
+  return buf;
+}
+async function resolveCover(cover) {
+  if (!cover) return null;
+  try {
+    if (cover.dataUrl) {
+      const m = String(cover.dataUrl).match(/^data:image\/(jpeg|jpg|png);base64,([\s\S]+)$/i);
+      if (!m) return null;
+      const buf = Buffer.from(m[2], 'base64');
+      if (buf.length > COVER_MAX_BYTES) return null;
+      return { buffer: buf, mime: imageMime(buf) };
+    }
+    if (cover.url) {
+      const buf = await fetchCoverBuffer(cover.url);
+      return { buffer: buf, mime: imageMime(buf) };
+    }
+  } catch (e) {
+    logError('cover', e);
+  }
+  return null;
+}
+// 封面候选只保留当前音源自带的图, 其余由用户本地上传
+async function findCovers(pic) {
+  if (!pic) return [];
+  return [{
+    url: pic, thumb: pic, source: '当前音源',
+    proxy: '/api/cover/img?url=' + encodeURIComponent(pic),
+  }];
+}
+
 // 按 chunk(样本组)边界把 m4a 切段, 每段重建 stts/stsc/stsz/stco, 返回 [{build()}]
 function splitM4a(buf, maxBytes) {
   const top = mp4Parse(buf, 0, buf.length);
@@ -807,9 +1032,9 @@ function splitM4a(buf, maxBytes) {
 }
 
 // 上传一段音频: 超过 200MB 时按需拆分; 未确认拆分则抛出 needSplit 供前端弹窗
-async function uploadAudioAuto({ buffer, ext, filename, song, artist, album, contentType, send, split }) {
+async function uploadAudioAuto({ buffer, ext, filename, song, artist, album, contentType, send, split, cover }) {
   if (buffer.length <= MAX_CLOUD_BYTES) {
-    const up = await uploadBuffer({ buffer, ext, filename, song, artist, album, contentType, send });
+    const up = await uploadBuffer({ buffer, ext, filename, song, artist, album, contentType, send, cover });
     return [{ song, songId: up.songId, instant: up.instant, size: buffer.length }];
   }
   const sizeMb = (buffer.length / 1048576).toFixed(0);
@@ -842,7 +1067,7 @@ async function uploadAudioAuto({ buffer, ext, filename, song, artist, album, con
     send(`--- 第 ${i + 1}/${builders.length} 段 (${(part.length / 1048576).toFixed(1)}MB) ---`);
     const up = await uploadBuffer({
       buffer: part, ext, filename: name + '.' + ext,
-      song: name, artist, album: album || '', contentType, send,
+      song: name, artist, album: album || '', contentType, send, cover,
     });
     send(`✓ 第 ${i + 1}/${builders.length} 段完成${up.instant ? ' (秒传)' : ''}`);
     out.push({ song: name, songId: up.songId, instant: up.instant, size: part.length });
@@ -917,11 +1142,20 @@ function cleanSongName(raw) {
     .replace(/[（(]\s*(?:无损音质|高音质|无损|高清|完整版|修复版|HQ|Hi-Res)\s*[)）]/gi, '')
     .replace(/\s{2,}/g, ' ').trim();
   if (!s) return null;
-  // 《歌名》—歌手 结构 (B站修复版/翻唱常见), 右侧去掉音质类修饰
-  const bm = s.match(/^《([^》]{1,40})》\s*[-–—~·]?\s*(.*)$/);
-  if (bm) {
-    const artist = bm[2].replace(/(?:无损音质|高音质|无损|高清|完整版|修复版)/gi, '').trim();
-    return { song: bm[1].trim(), artist: artist || null };
+  // 标题里任意位置出现《歌名》都算, 例如 【4K60P】周董《轨迹》最好听的版本！无与伦比演唱会
+  const anyBm = s.match(/《([^》]{1,40})》/);
+  if (anyBm) {
+    const song = anyBm[1].trim() || s;
+    const before = s.slice(0, anyBm.index).trim().replace(/[：:、,，\-–—~·\s]+$/, '');
+    let after = s.slice(anyBm.index + anyBm[0].length).trim()
+      .replace(/[（(][^)）]*[)）]/g, '')
+      .replace(/^[\-–—~·：:、,，\s]+/, '')
+      .replace(/[！!。.\s].*$/, '')
+      .trim();
+    // 只把像人名的短片段当歌手, 版本/演唱会之类的描述直接忽略
+    const usable = t => !!t && t.length <= 12 && !/版|演唱会|现场|翻唱|纯音乐|伴奏|合集|完整|高音质|无损|live|remix|cover/i.test(t);
+    const artist = usable(before) ? before : (usable(after) ? after : null);
+    return { song, artist };
   }
   const m = s.match(/^([^\-–—]{1,16}?)\s*[-–—]\s*(.{1,40})$/);
   if (m && m[1].trim() && m[2].trim() && !/版|翻唱|伴奏|cover|live|remix|纯音乐|钢琴|八音盒|串烧|混剪|DJ/i.test(m[2].trim()))
@@ -1012,6 +1246,7 @@ async function applePodcastUpload(pc, opts, send) {
   const ups = await uploadAudioAuto({
     buffer: buf, ext, filename: songName + '.' + ext,
     song: songName, artist, album: '', contentType: contentTypeFor(ext), send, split: !!opts.split,
+    cover: opts.cover,
   });
   ups.forEach(u => appendHistory({ source: '播客', url: ep.link, song: u.song, artist, songId: u.songId, size: u.size }));
   send(`✓ 上传完成${ups.every(u => u.instant) ? ' (秒传)' : ''}${ups.length > 1 ? `, 共 ${ups.length} 段` : ''}`);
@@ -1051,6 +1286,7 @@ async function xiaoyuzhouUpload(pc, opts, send) {
   const ups = await uploadAudioAuto({
     buffer: buf, ext, filename: songName + '.' + ext,
     song: songName, artist, album: '', contentType, send, split: !!opts.split,
+    cover: opts.cover,
   });
   ups.forEach(u => appendHistory({ source: '播客', url: pc.url, song: u.song, artist, songId: u.songId, size: u.size }));
   send(`✓ 上传完成${ups.every(u => u.instant) ? ' (秒传)' : ''}${ups.length > 1 ? `, 共 ${ups.length} 段` : ''}`);
@@ -1101,6 +1337,7 @@ async function audioUrlUpload(a, opts, send) {
   const ups = await uploadAudioAuto({
     buffer: buf, ext, filename: songName + '.' + ext,
     song: songName, artist, album: '', contentType: contentTypeFor(ext), send, split: !!opts.split,
+    cover: opts.cover,
   });
   ups.forEach(x => appendHistory({ source, url: a.url, song: x.song, artist, songId: x.songId, size: x.size }));
   send(`✓ 上传完成${ups.every(x => x.instant) ? ' (秒传)' : ''}${ups.length > 1 ? `, 共 ${ups.length} 段` : ''}`);
@@ -1137,8 +1374,10 @@ async function seasonUpload({ sid, mid }, opts, send) {
       results.push(...await biliUpload(bv, { ...opts, season: false, _inner: true }, send));
     } catch (e) {
       if (e.needSplit) throw e;
-      send(`✗ ${bv} 失败: ${e.message}`);
-      results.push({ input: bv, ok: false, error: e.message });
+      logError('upload', e);
+      const errMsg = friendlyError(e);
+      send(`✗ ${bv} 失败: ${errMsg}`);
+      results.push({ input: bv, ok: false, error: errMsg });
       if (e.authFail || /-101/.test(e.message)) { send('B站登录已过期, 请在页面右上角重新登录; 已停止剩余视频'); break; }
     }
   }
@@ -1178,8 +1417,10 @@ async function runJobs(inputs, opts, send) {
       }
     } catch (e) {
       if (e.needSplit) throw e;
-      send(`✗ 任务失败: ${e.message}`);
-      results.push({ input: item, ok: false, error: e.message });
+      logError('job', e);
+      const errMsg = friendlyError(e);
+      send(`✗ 任务失败: ${errMsg}`);
+      results.push({ input: item, ok: false, error: errMsg });
       if (e.authFail || /-101/.test(e.message)) { send('登录已失效, 终止剩余任务'); break; }
     }
   }
@@ -1218,8 +1459,10 @@ async function biliUpload(input, opts, send) {
           sub.push(...await biliUpload(eps[i], { ...opts, season: false, _inner: true }, send));
         } catch (e) {
           if (e.needSplit) throw e;
-          send(`✗ ${eps[i]} 失败: ${e.message}`);
-          sub.push({ input: eps[i], ok: false, error: e.message });
+          logError('upload', e);
+          const errMsg = friendlyError(e);
+          send(`✗ ${eps[i]} 失败: ${errMsg}`);
+          sub.push({ input: eps[i], ok: false, error: errMsg });
           if (e.authFail || /-101/.test(e.message)) { send('B站登录已过期, 请在页面右上角重新登录; 已停止剩余视频'); break; }
         }
       }
@@ -1297,6 +1540,7 @@ async function biliUpload(input, opts, send) {
         ups = await uploadAudioAuto({
           buffer: buf, ext, filename: songName + '.' + ext,
           song: songName, artist, album: '', contentType: ext === 'flac' ? 'audio/flac' : 'audio/mp4', send, split: !!opts.split,
+          cover: opts.cover,
         });
       } catch (e) {
         // m4a 被云盘拒绝时的转码兜底 (登录失效/需确认拆分时不重试; flac 原生支持无需兜底)
@@ -1306,7 +1550,7 @@ async function biliUpload(input, opts, send) {
         const mp3 = await transcodeMp3(buf);
         const up = await uploadBuffer({
           buffer: mp3, ext: 'mp3', filename: songName + '.mp3',
-          song: songName, artist, album: '', contentType: 'audio/mpeg', send,
+          song: songName, artist, album: '', contentType: 'audio/mpeg', send, cover: opts.cover,
         });
         ups = [{ song: songName, songId: up.songId, instant: up.instant, size: mp3.length }];
       }
@@ -1319,8 +1563,10 @@ async function biliUpload(input, opts, send) {
       send(`✓ 上传完成${ups.every(up => up.instant) ? ' (秒传)' : ''}${ups.length > 1 ? `, 共 ${ups.length} 段` : ''}`);
     } catch (e) {
       if (e.needSplit) throw e;
-      send(`✗ 这一段失败: ${e.message}`);
-      results.push({ page: pg.page, song: songName, ok: false, error: e.message });
+      logError('upload', e);
+      const errMsg = friendlyError(e);
+      send(`✗ 这一段失败: ${errMsg}`);
+      results.push({ page: pg.page, song: songName, ok: false, error: errMsg });
       // 登录失效: 后续每P必然同样失败, 提前终止
       if (e.authFail || /-101/.test(e.message)) { send('B站登录已过期, 请在页面右上角重新登录; 已停止剩余段落'); break; }
     }
@@ -1813,7 +2059,8 @@ async function indexLyricForSong(title, artist, durSec, send) {
     }
     if (send) send('[歌词] 找到的版本没有可用歌词');
   } catch (e) {
-    if (send) send('[歌词] 关联失败: ' + e.message);
+    logError('lyric', e);
+    if (send) send('[歌词] 关联失败: ' + friendlyError(e));
   }
 }
 
@@ -1953,7 +2200,8 @@ async function tryBiliSubtitle(bvid, pg, songName, artist, send) {
         : '[歌词] B站字幕不像歌词');
     }
   } catch (e) {
-    if (send) send('[歌词] B站字幕读取失败: ' + e.message);
+    logError('lyric', e);
+    if (send) send('[歌词] B站字幕读取失败: ' + friendlyError(e));
   }
   return false;
 }
@@ -2038,34 +2286,76 @@ async function biliPageInfo(bvid, page) {
   if (!pg) throw new Error('B站视频里找不到这段音频');
   return { pg, title: (view.data && view.data.title) || '' };
 }
+// whisper.cpp 直接读 flac/mp3/ogg/wav, 输出 JSON 到 <prefix>.json
+function runCppAsr(a, file, send) {
+  return new Promise((resolve, reject) => {
+    const prefix = file + '.out';
+    const outJson = prefix + '.json';
+    try { fs.unlinkSync(outJson); } catch (e) {}
+    const threads = Math.max(2, Math.min(8, (os.cpus() || []).length || 4));
+    const args = ['-m', a.model, '-f', file, '-l', 'zh', '-t', String(threads), '-oj', '-of', prefix, '-np'];
+    sttStopping = false;
+    sttChild = execFile(a.cli, args,
+      { cwd: path.dirname(a.cli), timeout: 900000, maxBuffer: 32 * 1048576, windowsHide: true },
+      (err, so, se) => {
+        sttChild = null;
+        let raw = '';
+        try { raw = fs.readFileSync(outJson, 'utf8'); } catch (e) {}
+        try { fs.unlinkSync(outJson); } catch (e) {}
+        if (err && !raw) {
+          if (sttStopping) return reject(new Error('__canceled__'));
+          const tail = String(se || err.message || '').trim().split(/\r?\n/).pop();
+          return reject(new Error('本地识别失败: ' + (tail || err.message).slice(0, 160)));
+        }
+        let j = null;
+        try { j = JSON.parse(raw); } catch (e) {}
+        if (!j) return reject(new Error('本地识别失败: 没有返回结果'));
+        const segs = (j.transcription || []).map(x => ({
+          start: (Number(x.offsets && x.offsets.from) || 0) / 1000,
+          end: (Number(x.offsets && x.offsets.to) || 0) / 1000,
+          text: String(x.text || '').trim(),
+        })).filter(x => x.text);
+        if (!segs.length) return reject(new Error('本地识别失败: 没有听清这段音频'));
+        resolve(segs);
+      });
+  });
+}
 // whisper 转写一个本地音频文件, 通过校验后写入歌词索引
 async function whisperFileToLyric(tmp, durSec, title, artist, send, extra) {
   let timer = null;
   const started = Date.now();
   if (sttBusy) { try { fs.unlinkSync(tmp); } catch (e) {} throw new Error('本地识别正在忙, 请稍后再试'); }
+  const a = asrReady();
+  if (!a.ready) { try { fs.unlinkSync(tmp); } catch (e) {} throw new Error('还没有安装语音识别组件, 请先在补时间轴面板里下载'); }
   sttBusy = true;
   try {
-    const stdout = await new Promise((resolve, reject) => {
-      timer = setInterval(() => {
-        send('[补时间轴] 识别中… 已等待 ' + Math.round((Date.now() - started) / 1000) + 's');
-      }, 10000);
-      if (timer.unref) timer.unref();
-      sttStopping = false;
-      sttChild = execFile(ASR_PY, [ASR_SCRIPT, '--model', 'base', '--file', tmp],
-        { timeout: 900000, maxBuffer: 32 * 1048576, windowsHide: true },
-        (err, so, se) => {
-          sttChild = null;
-          if (err && !String(so || '').trim()) {
-            if (sttStopping) return reject(new Error('__canceled__'));
-            const tail = String(se || err.message || '').trim().split(/\r?\n/).pop();
-            return reject(new Error('本地识别失败: ' + (tail || err.message).slice(0, 160)));
-          }
-          resolve(String(so || ''));
-        });
-    });
-    const o = parseEarResult(stdout);
-    if (!o || o.type === 'error') throw new Error('本地识别失败: ' + ((o && o.message) || '没有返回结果'));
-    const lrc = segmentsToLrc(o.segments);
+    let segments = null;
+    timer = setInterval(() => {
+      send('[补时间轴] 识别中… 已等待 ' + Math.round((Date.now() - started) / 1000) + 's');
+    }, 10000);
+    if (timer.unref) timer.unref();
+    if (a.backend === 'cpp') {
+      segments = await runCppAsr(a, tmp, send);
+    } else {
+      const stdout = await new Promise((resolve, reject) => {
+        sttStopping = false;
+        sttChild = execFile(ASR_PY, [ASR_SCRIPT, '--model', 'base', '--file', tmp],
+          { timeout: 900000, maxBuffer: 32 * 1048576, windowsHide: true },
+          (err, so, se) => {
+            sttChild = null;
+            if (err && !String(so || '').trim()) {
+              if (sttStopping) return reject(new Error('__canceled__'));
+              const tail = String(se || err.message || '').trim().split(/\r?\n/).pop();
+              return reject(new Error('本地识别失败: ' + (tail || err.message).slice(0, 160)));
+            }
+            resolve(String(so || ''));
+          });
+      });
+      const o = parseEarResult(stdout);
+      if (!o || o.type === 'error') throw new Error('本地识别失败: ' + ((o && o.message) || '没有返回结果'));
+      segments = o.segments;
+    }
+    const lrc = segmentsToLrc(segments);
     const v = lrcAudit(lrc, { durSec, minLines: 5 });
     if (!v.ok) throw new Error('识别结果不像完整歌词(' + v.reason + '), 没有保存');
     const rec = lyrIdxPut(title, artist, {
@@ -2088,9 +2378,8 @@ async function whisperFileToLyric(tmp, durSec, title, artist, send, extra) {
   }
 }
 async function sttLyricForSong(title, artist, send, pre) {
-  if (!fs.existsSync(ASR_SCRIPT)) throw new Error('缺少 asr/transcribe.py, 无法本地转写');
-  if (!fs.existsSync(path.join(DIR, 'asr', '.venv', 'Scripts', 'python.exe'))) throw new Error('缺少本地识别环境 asr/.venv, 无法补时间轴');
-  if (!fs.existsSync(path.join(DIR, 'asr', 'models', 'faster-whisper-base'))) throw new Error('缺少 whisper 模型 asr/models/faster-whisper-base, 无法补时间轴');
+  const asr = asrReady();
+  if (!asr.ready) throw new Error('还没有安装语音识别组件, 请先在补时间轴面板里下载');
   // 拆分上传的分段只有一段音频, 拿整首时间轴会错位, 直接拒绝, 不写脏数据
   if (/[（(]\d+\s*\/\s*\d+[）)]/.test(title)) {
     throw new Error('这是超过 200MB 拆分上传的分段，时间轴无法可靠对齐，暂不支持补时间轴；请用完整的那一首');
@@ -2098,6 +2387,8 @@ async function sttLyricForSong(title, artist, send, pre) {
   if (sttBusy) throw new Error('本地识别正在忙, 请稍后再试');
   const h = (pre && pre.h) || findHistoryBySong(title, artist, true);
   if (!h) throw new Error('上传历史里找不到这首歌, 无法取回音频; 请先确认它是由本工具上传的');
+  // whisper.cpp 读不了 m4a: 优先从云盘取回整首 flac/mp3
+  if (asr.backend === 'cpp' && h.songId) return sttLyricFromCloud(title, artist, send, h);
   // 没有B站音源(非播客的其他来源): 改用网易云云盘里自己上传的那份音频
   if (!h.bvid || !h.page) return sttLyricFromCloud(title, artist, send, h);
   send('[补时间轴] 找到音源: ' + h.bvid + ' 第' + h.page + '段 (' + (h.time || '') + ')');
@@ -2117,6 +2408,9 @@ async function sttLyricForSong(title, artist, send, pre) {
   if (play.code !== 0 || !play.data.dash) throw new Error('playurl失败: ' + (play.message || '无DASH流'));
   const picked = pickAudio(play.data.dash, 'best');
   if (!picked || !picked.a) throw new Error('这段音频没有可下载的音频流');
+  if (asr.backend === 'cpp' && picked.a.id !== 30251) {
+    throw new Error('这段 B 站音源是 m4a 格式，本地识别组件读不了；请先把这首歌传到云盘后再补时间轴');
+  }
   const buf = await downloadAudio(picked.a, H, send);
   send('[补时间轴] 已取到音频 ' + (buf.length / 1048576).toFixed(2) + 'MB, 开始本地识别(可能要几分钟, 请不要关闭页面)');
   const ext = picked.a.id === 30251 ? '.flac' : '.m4a';
@@ -2142,7 +2436,9 @@ async function sttLyricFromCloud(title, artist, send, h0) {
   const dur = Number(d.time) > 0 ? Number(d.time) / 1000 : 0;
   if (dur > 1800) throw new Error('这段音频超过 30 分钟，不自动补时间轴');
   send2('[补时间轴] 已取到音频 ' + (buf.length / 1048576).toFixed(2) + 'MB, 开始本地识别(可能要几分钟, 请不要关闭页面)');
-  const ext = /flac/i.test(String(d.type || '')) ? '.flac' : '.mp3';
+  const ty = String(d.type || '');
+  const ext = /flac/i.test(ty) ? '.flac' : /mp3|mpeg/i.test(ty) ? '.mp3' : /m4a|mp4|aac/i.test(ty) ? '.m4a' : '.mp3';
+  if (a.backend === 'cpp' && ext === '.m4a') throw new Error('这首歌的云盘音频是 m4a 格式，本地识别组件读不了；换一首试试');
   const tmp = path.join(os.tmpdir(), 'graysongicu_stt_' + Date.now() + ext);
   try { fs.writeFileSync(tmp, buf); }
   catch (e) { throw new Error('临时文件写入失败: ' + e.message); }
@@ -2256,7 +2552,8 @@ async function lyrBatchRun(list) {
     } catch (e) {
       if (e.message === '__canceled__') { LYR_BATCH.canceled = true; break; }
       LYR_BATCH.failed++; LYR_BATCH.done++;
-      lyrBatchLog('  失败: ' + e.message);
+      logError('lyric-batch', e);
+      lyrBatchLog('  失败: ' + friendlyError(e));
     }
     if (!LYR_BATCH.canceled) await new Promise(r => setTimeout(r, 1200));
   }
@@ -2446,7 +2743,8 @@ async function lyricFor(title, artist, durSec) {
       }
     }
   } catch (e) {
-    out = { ok: false, error: e.message };
+    logError('lyric', e);
+    out = { ok: false, error: friendlyError(e) };
   }
   // 未校对的转写: 播放时明确提示, 避免用户把它当官方歌词
   if (out && out.ok && out.fromIndex && out.verify === 'none') {
@@ -2721,9 +3019,31 @@ function liveSeek(sec) {
 }
 
 // ---------- 桌面歌词独立窗口 (Electron): 由服务端按需拉起 ----------
-const DESKTOP_DIR = path.join(DIR, 'desktop');
-let lyricProc = null, lyricInstalling = false;
-function lyricWindowRunning() { return !!lyricProc; }
+const DESKTOP_DIR = path.join(APP_DIR, 'desktop');
+let lyricProc = null, lyricInstalling = false, lyricHookRunning = false;
+function lyricWindowRunning() { return lyricHookRunning || !!lyricProc; }
+// 打包版: 歌词窗由 Electron 主进程负责, 服务端通过本机钩子请求开/关
+function lyricHook(action) {
+  const base = process.env.GRAYSONGICU_LYRIC_HOOK;
+  if (!base) return Promise.resolve(null);
+  return new Promise(resolve => {
+    let u;
+    try { u = new URL('/lyric/' + action, base); } catch (e) { return resolve(null); }
+    const r = http.request({ hostname: u.hostname, port: u.port, path: u.pathname, method: 'POST' }, res => {
+      let t = '';
+      res.on('data', d => t += d);
+      res.on('end', () => { try { resolve(JSON.parse(t)); } catch (e) { resolve(null); } });
+    });
+    r.on('error', () => resolve(null));
+    r.setTimeout(3000, () => { r.destroy(); resolve(null); });
+    r.end();
+  });
+}
+async function lyricWindowState() {
+  const hooked = await lyricHook('state');
+  if (hooked) lyricHookRunning = !!hooked.running;
+  return { running: lyricWindowRunning(), installing: lyricInstalling };
+}
 function electronBinPath() {
   try {
     const p = require(path.join(DESKTOP_DIR, 'node_modules', 'electron'));
@@ -2737,7 +3057,8 @@ function startLyricProc(bin) {
     lyricProc.on('error', () => { lyricProc = null; });
   } catch (e) {
     lyricProc = null;
-    return { ok: false, error: e.message };
+    logError('desktop-lyric', e);
+    return { ok: false, error: '桌面歌词启动失败, 请确认桌面歌词程序已安装后重试。' };
   }
   return { ok: true, running: true };
 }
@@ -2760,7 +3081,9 @@ function installElectron() {
     } catch (e) { finish(false); }
   });
 }
-function openLyricWindow() {
+async function openLyricWindow() {
+  const hooked = await lyricHook('open');
+  if (hooked) { lyricHookRunning = !!hooked.running; return hooked; }
   if (lyricProc) return { ok: true, running: true };
   const bin = electronBinPath();
   if (!bin) {
@@ -2774,21 +3097,180 @@ function openLyricWindow() {
   }
   return startLyricProc(bin);
 }
-function closeLyricWindow() {
+async function closeLyricWindow() {
+  const hooked = await lyricHook('close');
+  if (hooked) { lyricHookRunning = false; return hooked; }
   if (lyricProc) { try { lyricProc.kill(); } catch (e) {} lyricProc = null; }
   return { ok: true, running: false };
 }
 
-// ---------- 本地转写: faster-whisper 离线听整段音频(补时间轴用) ----------
-const ASR_SCRIPT = path.join(DIR, 'asr', 'transcribe.py');
-const ASR_VENV_PY = path.join(DIR, 'asr', '.venv', 'Scripts', 'python.exe');
+// ---------- 本地转写: 优先用可下载的 whisper.cpp 组件, 开发机也可用 faster-whisper ----------
+const ASR_SCRIPT = path.join(APP_DIR, 'asr', 'transcribe.py');
+const ASR_VENV_PY = path.join(APP_DIR, 'asr', '.venv', 'Scripts', 'python.exe');
 const ASR_PY = fs.existsSync(ASR_VENV_PY) ? ASR_VENV_PY : 'python';
+// 组件默认装在数据目录; 桌面版可指定装到程序文件夹, 用户删整个文件夹就能清干净
+const ASR_PACK_DIR = process.env.GRAYSONGICU_ASR_DIR || path.join(DIR, 'asr-pack');
+const ASR_LEGACY_DIR = path.join(DIR, 'asr-pack');
+const ASR_CPP_DIR = path.join(ASR_PACK_DIR, 'whisper');
+const ASR_CPP_CLI = path.join(ASR_CPP_DIR, 'whisper-cli.exe');
+const ASR_CPP_MODEL = path.join(ASR_PACK_DIR, 'ggml-base.bin');
+
+function asrFindPack() {
+  const dirs = ASR_PACK_DIR === ASR_LEGACY_DIR ? [ASR_PACK_DIR] : [ASR_PACK_DIR, ASR_LEGACY_DIR];
+  for (const d of dirs) {
+    const cli = path.join(d, 'whisper', 'whisper-cli.exe');
+    const model = path.join(d, 'ggml-base.bin');
+    if (fs.existsSync(cli) && fs.existsSync(model)) return { dir: d, cli, model };
+  }
+  return null;
+}
+const ASR_WHISPER_URLS = [
+  'https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip',
+  'https://ghproxy.net/https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip',
+  'https://gh-proxy.com/https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip',
+];
+const ASR_MODEL_URLS = [
+  'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-base.bin',
+  'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin',
+];
+const ASR_PACK_BYTES = 150 * 1024 * 1024;
+let ASR_INSTALL = { running: false, step: '', loaded: 0, total: 0, error: '', startedAt: 0, finishedAt: 0 };
+
 // 本机没有 Python / 模型时, 只是失去本地转写能力, B站字幕与网易云歌词照常可用
 function asrReady() {
-  if (!fs.existsSync(ASR_SCRIPT)) return { ready: false, reason: '缺少转写脚本' };
-  if (!fs.existsSync(ASR_VENV_PY)) return { ready: false, reason: '未安装 Python 环境' };
-  if (!fs.existsSync(path.join(DIR, 'asr', 'models', 'faster-whisper-base'))) return { ready: false, reason: '未下载语音模型' };
-  return { ready: true, reason: '' };
+  const pack = asrFindPack();
+  if (pack) return { ready: true, backend: 'cpp', reason: '', cli: pack.cli, model: pack.model };
+  if (!fs.existsSync(ASR_SCRIPT)) return { ready: false, backend: 'none', reason: '未安装语音识别组件' };
+  if (!fs.existsSync(ASR_VENV_PY)) return { ready: false, backend: 'none', reason: '未安装语音识别组件' };
+  if (!fs.existsSync(path.join(APP_DIR, 'asr', 'models', 'faster-whisper-base'))) return { ready: false, backend: 'none', reason: '未安装语音识别组件' };
+  return { ready: true, backend: 'python', reason: '' };
+}
+function asrStatus() {
+  const a = asrReady();
+  return {
+    ok: true, ready: a.ready, backend: a.backend, reason: a.reason,
+    installing: ASR_INSTALL.running, step: ASR_INSTALL.step,
+    loaded: ASR_INSTALL.loaded, total: ASR_INSTALL.total, error: ASR_INSTALL.error || '',
+  };
+}
+// 流式下载到文件, 支持重定向, 避免把 140MB 模型读进内存
+function downloadToFile(url, dest, onProgress, timeoutMs = 900000) {
+  return new Promise((resolve, reject) => {
+    const go = (target, redirects) => {
+      let u;
+      try { u = new URL(target); } catch (e) { return reject(new Error('下载地址无效')); }
+      const lib = u.protocol === 'https:' ? https : http;
+      const r = lib.get(target, { headers: { 'User-Agent': UA, 'Accept': '*/*' }, timeout: timeoutMs }, res => {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          res.resume();
+          if (redirects <= 0) return reject(new Error('下载重定向次数过多'));
+          return go(new URL(res.headers.location, target).toString(), redirects - 1);
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error('下载失败 (HTTP ' + res.statusCode + ')'));
+        }
+        const total = Number(res.headers['content-length'] || 0);
+        let loaded = 0;
+        const part = dest + '.part';
+        try { fs.mkdirSync(path.dirname(dest), { recursive: true }); } catch (e) {}
+        const ws = fs.createWriteStream(part);
+        res.on('data', d => { loaded += d.length; onProgress(loaded, total); });
+        res.on('error', e => { try { ws.destroy(); } catch (_) {} reject(e); });
+        ws.on('error', reject);
+        ws.on('finish', () => {
+          fs.rename(part, dest, err => err ? reject(err) : resolve({ size: loaded, total }));
+        });
+        res.pipe(ws);
+      });
+      r.on('error', reject);
+      r.on('timeout', () => r.destroy(new Error('下载超时')));
+    };
+    go(url, 5);
+  });
+}
+function expandZip(zip, dest) {
+  return new Promise((resolve, reject) => {
+    const q = s => "'" + String(s).replace(/'/g, "''") + "'";
+    const script = 'Expand-Archive -LiteralPath ' + q(zip) + ' -DestinationPath ' + q(dest) + ' -Force';
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
+      { timeout: 180000, windowsHide: true },
+      (err, so, se) => err ? reject(new Error('解压识别组件失败: ' + String(se || err.message).split(/\r?\n/).pop())) : resolve());
+  });
+}
+async function installAsrPack() {
+  if (ASR_INSTALL.running) return { ok: true, started: false, running: true };
+  if (asrReady().ready) return { ok: true, started: false, ready: true };
+  if (sttBusy) return { ok: false, error: '正在补时间轴，请识别结束后再安装组件' };
+  const tmp = path.join(ASR_PACK_DIR, '_install');
+  ASR_INSTALL = { running: true, step: '准备下载', loaded: 0, total: 0, error: '', startedAt: Date.now(), finishedAt: 0 };
+  (async () => {
+    try {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) {}
+      fs.mkdirSync(tmp, { recursive: true });
+      const zip = path.join(tmp, 'whisper.zip');
+      let zipped = false, zipErr = null;
+      for (const url of ASR_WHISPER_URLS) {
+        try {
+          ASR_INSTALL.step = '下载识别程序';
+          ASR_INSTALL.loaded = 0; ASR_INSTALL.total = 0;
+          await downloadToFile(url, zip, (n, t) => { ASR_INSTALL.loaded = n; ASR_INSTALL.total = t; });
+          if (fs.statSync(zip).size < 3 * 1024 * 1024) throw new Error('识别程序文件不完整');
+          zipped = true;
+          break;
+        } catch (e) {
+          zipErr = e;
+          try { fs.unlinkSync(zip); } catch (_) {}
+          try { fs.unlinkSync(zip + '.part'); } catch (_) {}
+        }
+      }
+      if (!zipped) throw zipErr || new Error('识别程序下载失败');
+      ASR_INSTALL.step = '解压识别程序';
+      ASR_INSTALL.loaded = 0; ASR_INSTALL.total = 0;
+      await expandZip(zip, tmp);
+      const rel = ['Release', 'release', 'bin'].map(x => path.join(tmp, x)).find(p => fs.existsSync(p));
+      const src = rel || tmp;
+      fs.mkdirSync(ASR_CPP_DIR, { recursive: true });
+      for (const f of fs.readdirSync(src)) {
+        if (!/\.(exe|dll)$/i.test(f)) continue;
+        if (!/^(whisper-cli|whisper|ggml|llama|SDL2)/i.test(f)) continue;
+        fs.copyFileSync(path.join(src, f), path.join(ASR_CPP_DIR, f));
+      }
+      if (!fs.existsSync(ASR_CPP_CLI)) throw new Error('识别程序解压后缺少 whisper-cli.exe');
+      const part = path.join(ASR_PACK_DIR, 'ggml-base.bin.part');
+      let downloaded = false;
+      let lastErr = null;
+      for (const url of ASR_MODEL_URLS) {
+        try {
+          ASR_INSTALL.step = '下载中文模型';
+          ASR_INSTALL.loaded = 0; ASR_INSTALL.total = 0;
+          await downloadToFile(url, part, (n, t) => { ASR_INSTALL.loaded = n; ASR_INSTALL.total = t; });
+          const sz = fs.statSync(part).size;
+          if (sz < 100 * 1024 * 1024) throw new Error('模型文件不完整');
+          downloaded = true;
+          break;
+        } catch (e) { lastErr = e; try { fs.unlinkSync(part); } catch (_) {} }
+      }
+      if (!downloaded) throw lastErr || new Error('模型下载失败');
+      fs.renameSync(part, ASR_CPP_MODEL);
+      try {
+        fs.writeFileSync(path.join(ASR_PACK_DIR, 'README.txt'),
+          'GraySongICU 可选语音识别组件\n\n' +
+          'whisper.cpp (MIT License): https://github.com/ggml-org/whisper.cpp\n' +
+          'Model ggml-base.bin: https://huggingface.co/ggerganov/whisper.cpp\n\n' +
+          '只在补时间轴时本机离线运行, 不联网上传音频。\n');
+      } catch (e) {}
+      ASR_INSTALL.step = '完成';
+      ASR_INSTALL.finishedAt = Date.now();
+    } catch (e) {
+      ASR_INSTALL.error = friendlyError(e);
+      logError('asr-install', e);
+    } finally {
+      ASR_INSTALL.running = false;
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) {}
+    }
+  })();
+  return { ok: true, started: true, running: true };
 }
 
 // ---------- 页面 ----------
@@ -3039,6 +3521,25 @@ const PAGE = `<!DOCTYPE html>
   .cand-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
   .cand-m{margin-top:2px;color:var(--t3);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .cand-a{display:flex;gap:8px;flex:none}
+  .cover-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;max-height:300px;overflow:auto;margin:10px 0 12px;padding-right:2px}
+  .cover-item{position:relative;aspect-ratio:1;border:2px solid transparent;border-radius:8px;overflow:hidden;background:#f3f3f6;cursor:pointer}
+  .cover-item img{width:100%;height:100%;object-fit:cover;display:block}
+  .cover-item:hover{border-color:#d9d9e0}
+  .cover-item.sel{border-color:var(--red);box-shadow:0 0 0 2px rgba(236,65,65,.15)}
+  .cover-tag{position:absolute;left:3px;bottom:3px;max-width:calc(100% - 6px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;line-height:1.5;padding:0 5px;border-radius:4px;background:rgba(0,0,0,.55);color:#fff}
+  .cover-empty{grid-column:1/-1;padding:24px 0;text-align:center;font-size:12.5px;color:var(--t3)}
+  .cover-custom{display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:12px;color:var(--t3)}
+  .cover-custom img{width:42px;height:42px;border-radius:6px;object-fit:cover}
+  .cover-custom span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cover-acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .cover-acts .spacer{flex:1}
+  .cover-up{display:inline-flex;align-items:center;cursor:pointer}
+  .local-drop{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px;padding:28px 18px;margin-top:14px;border:1.5px dashed #dadae2;border-radius:12px;background:#fafafc;cursor:pointer;text-align:center;transition:border-color .15s,background .15s}
+  .local-drop.on,.local-drop:hover{border-color:var(--red);background:#fff7f8}
+  .local-ico{font-size:24px;line-height:1;color:var(--red);opacity:.85}
+  .local-drop b{font-size:13.5px;font-weight:600;color:var(--t1);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .local-drop span{font-size:12px;color:var(--t3);line-height:1.6}
+  @media (max-width:640px){.cover-grid{grid-template-columns:repeat(3,minmax(0,1fr));max-height:260px}}
   .fix-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
   .grp{margin-top:14px;border-top:1px solid var(--line-soft)}
   .grp summary{display:flex;align-items:center;justify-content:space-between;padding:12px 0;font-size:12.5px;color:var(--t2);cursor:pointer;user-select:none}
@@ -3092,6 +3593,7 @@ const PAGE = `<!DOCTYPE html>
     <div class="tabs" role="tablist">
       <button class="tab on" data-tab="fix" onclick="switchTab('fix')">补歌</button>
       <button class="tab" data-tab="up" onclick="switchTab('up')">上传</button>
+      <button class="tab" data-tab="local" onclick="switchTab('local')">留声机</button>
     </div>
     <div class="top-right">
       <button class="acct-btn lyr-btn" id="lyrBtn" onclick="toggleLyric()" title="桌面歌词（置顶字幕，跟随网易云播放）" aria-pressed="false"><span class="lyr-ico" aria-hidden="true">♪</span><span class="lyr-label" id="lyrLabel">歌词</span></button>
@@ -3146,6 +3648,31 @@ const PAGE = `<!DOCTYPE html>
       <input type="text" id="song" placeholder="歌名 (留空=自动)">
       <input type="text" id="artist" placeholder="歌手 (留空=自动)">
     </div>
+  </section>
+
+  <section class="card" id="localCard" hidden>
+    <div class="fix-head">
+      <h2>留声机</h2>
+      <span class="side-note">本地音频直接传进云盘</span>
+    </div>
+    <label class="local-drop" id="localDrop" for="localFile">
+      <input type="file" id="localFile" accept=".mp3,.m4a,.aac,.flac,.ogg,.wav,audio/*" hidden>
+      <span class="local-ico" aria-hidden="true">♪</span>
+      <b id="localName">点击选择或拖入音频文件</b>
+      <span id="localHint">MP3 / M4A / FLAC / AAC / OGG / WAV，单文件不超过 200MB</span>
+    </label>
+    <div class="more" id="localMore" style="display:flex">
+      <input type="text" id="localSong" placeholder="歌名 (留空=按文件名)">
+      <input type="text" id="localArtist" placeholder="歌手 (留空=自动)">
+      <input type="text" id="localAlbum" placeholder="专辑 (可选)">
+    </div>
+    <div class="sub" style="margin-top:10px">
+      <label class="chk" title="去掉序号与标签, 自动拆分歌手和歌名"><input type="checkbox" id="localClean" checked>整理歌名</label>
+    </div>
+    <div class="upload" style="margin-top:12px">
+      <button class="btn" id="localGo" onclick="doLocalUpload()">上传到云盘</button>
+    </div>
+    <p class="split-p" style="margin-top:10px">上传前会弹出封面选择：保留音频原封面、本地选一张，或者不用封面。</p>
   </section>
 
   <section class="progress" id="progress" hidden>
@@ -3249,6 +3776,22 @@ const PAGE = `<!DOCTYPE html>
   </div>
 </div>
 
+<div class="acct-modal" id="coverModal" hidden>
+  <div class="acct-card" role="dialog" aria-label="选择歌曲封面">
+    <div class="acct-head"><span id="coverTitle">选择封面</span><button class="mini" onclick="cancelCoverPick()">关闭</button></div>
+    <p class="split-p" id="coverSub"></p>
+    <div class="cover-grid" id="coverGrid"></div>
+    <div class="cover-custom" id="coverCustom" hidden><img id="coverCustomImg" alt=""><span id="coverCustomName"></span></div>
+    <div class="cover-acts">
+      <label class="mini cover-up">本地上传图片<input type="file" id="coverFile" accept="image/jpeg,image/png" hidden></label>
+      <button class="mini" onclick="skipCoverPick()">不用封面</button>
+      <span class="spacer"></span>
+      <button class="mini" onclick="cancelCoverPick()">取消上传</button>
+      <button class="mini primary" id="coverYes" onclick="confirmCoverPick()" disabled>用这张</button>
+    </div>
+  </div>
+</div>
+
 <div class="acct-modal" id="guideModal" hidden>
   <div class="acct-card" role="dialog" aria-label="快速上手">
     <div class="acct-head"><span id="guideTitle">快速上手</span><button class="mini" onclick="closeGuide()">关闭</button></div>
@@ -3307,6 +3850,7 @@ const PAGE = `<!DOCTYPE html>
            oninput="seekLyric(this.value)" aria-label="校准进度">
     <div id="lyrCands" style="display:none;margin:8px 0 0;max-height:230px;overflow:auto;border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:6px 8px;font-size:12px;line-height:1.6"></div>
     <div id="sttBox" style="display:none;margin:8px 0 0;border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.7">
+      <div id="sttAsr" style="display:none;margin-bottom:8px"></div>
       <div id="sttBody" style="max-height:200px;overflow:auto"></div>
       <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
         <button class="mini primary" id="sttGo" onclick="sttStart()">开始补时间轴</button>
@@ -3366,28 +3910,30 @@ const PAGE = `<!DOCTYPE html>
 <script>
 function esc(s){ return String(s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 const $ = id => document.getElementById(id);
-function lockScroll(){ document.body.style.overflow = (!$('biliPanel').hidden || !$('accountModal').hidden || !$('splitModal').hidden || !$('pickModal').hidden || !$('favModal').hidden || !$('guideModal').hidden || !$('listenModal').hidden || !$('srcModal').hidden || !$('lyricModal').hidden) ? 'hidden' : ''; }
+function lockScroll(){ document.body.style.overflow = (!$('biliPanel').hidden || !$('accountModal').hidden || !$('splitModal').hidden || !$('coverModal').hidden || !$('pickModal').hidden || !$('favModal').hidden || !$('guideModal').hidden || !$('listenModal').hidden || !$('srcModal').hidden || !$('lyricModal').hidden) ? 'hidden' : ''; }
 function openAccount(){ $('accountModal').hidden = false; lockScroll(); }
 function closeAccount(){ $('accountModal').hidden = true; lockScroll(); }
 function toggleManual(){ $('manualBox').hidden = !$('manualBox').hidden; }
 function toggleMore(){ $('more').classList.toggle('open'); }
 function focusInput(){ $('input').focus(); }
 
-// 导航两级: 一级 补歌/上传; 上传下二级 音乐(B站)/播客(苹果·小宇宙). 进度与历史共用
+// 导航三级: 补歌 / 上传 / 留声机; 上传下二级 音乐(B站)/播客(苹果·小宇宙). 进度与历史共用
 let curTab = 'fix', curType = 'music';
 function switchTab(t) {
-  const next = t === 'up' ? 'up' : 'fix';
+  const next = t === 'up' ? 'up' : (t === 'local' ? 'local' : 'fix');
   const changed = next !== curTab;
   curTab = next;
   try { localStorage.setItem('GraySongICU.tab', curTab); } catch (e) {}
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.tab === curTab));
-  const fix = curTab === 'fix';
+  const fix = curTab === 'fix', loc = curTab === 'local';
   $('fixCard').hidden = !fix;
   $('fixSide').hidden = !fix;
-  $('uploadCard').hidden = fix;
-  $('searchCard').hidden = fix;
+  $('uploadCard').hidden = curTab !== 'up';
+  $('localCard').hidden = !loc;
+  $('searchCard').hidden = fix || loc;
   $('compare').hidden = fix;
   if (fix) { setSplit(false); loadPlaylists(); loadSide(); }
+  else if (loc) setSplit(false);
   else applyType();
   if (changed) window.scrollTo(0, 0);
 }
@@ -3436,7 +3982,7 @@ function openSplit(info) {
   lockScroll();
 }
 function closeSplit(){ $('splitModal').hidden = true; splitInfo = null; lockScroll(); }
-function confirmSplit(){ closeSplit(); doUpload(true); }
+function confirmSplit(){ closeSplit(); doUpload(true, true); }
 
 // 日志流: 全文进「详细日志」, 简短一行进 pNow, 错误行进 pErrs (错误态常驻可见)
 function step(msg, isErr) {
@@ -3542,7 +4088,7 @@ async function showQr(kind) {
     $('qrimg').innerHTML = '<img src="/api/qr/svg?text=' + encodeURIComponent(r.text) + '" alt="二维码">';
     $('qrstate').textContent = '请用' + (kind === 'bili' ? '哔哩哔哩' : '网易云音乐') + 'App扫码, 成功后自动登录';
     qrTimer = setInterval(pollQr, 2000);
-  } catch (e) { $('qrstate').textContent = e.message; }
+  } catch (e) { $('qrstate').textContent = errMsg(e, '二维码获取失败'); }
 }
 async function pollQr() {
   try {
@@ -3674,7 +4220,7 @@ async function openFav(song, ids) {
     $('favPl').innerHTML = own.map(p =>
       '<option value="' + p.id + '"' + (p.special ? ' selected' : '') + '>' + esc(p.name) + '（' + p.count + ' 首）</option>').join('');
   } catch (e) {
-    $('favPl').innerHTML = '<option value="">' + esc(e.message) + '</option>';
+    $('favPl').innerHTML = '<option value="">' + esc(errMsg(e, '歌单读取失败')) + '</option>';
   }
 }
 function openBatchFav() {
@@ -3700,7 +4246,7 @@ async function confirmFav() {
     closeFav();
     if (wasBatch) toggleBatch();
   } catch (e) {
-    alert('收藏失败: ' + e.message);
+    alert('收藏失败: ' + errMsg(e, '请稍后重试'));
   }
   btn.disabled = false; btn.textContent = '收藏';
 }
@@ -3808,7 +4354,7 @@ async function scanGray() {
     renderFix();
   } catch (e) {
     graySongs = [];
-    box.innerHTML = '<div class="empty">' + esc(e.message) + '<br><button onclick="scanGray()">重试</button></div>';
+    box.innerHTML = '<div class="empty">' + esc(errMsg(e, '歌单扫描失败')) + '<br><button onclick="scanGray()">重试</button></div>';
   }
   btn.disabled = false; btn.textContent = '开始扫描';
 }
@@ -4018,6 +4564,7 @@ function openSttPanel(){
   closeCands();
   if (!t) {
     go.disabled = true;
+    $('sttAsr').style.display = 'none';
     body.innerHTML = '<div>现在没识别到正在播放的歌。先在网易云播放要补时间轴的那一首，再点这个按钮。</div>';
     return;
   }
@@ -4031,8 +4578,50 @@ function openSttPanel(){
     '<div>· 原本没有歌词、或歌词没有时间轴的歌，也能逐句滚动；<br>· 声音只在本机处理，不联网、不上传；<br>· 不改动云盘里已上传的音频。</div>' +
     '<div style="margin-top:6px;opacity:.9">代价</div>' +
     '<div>· 机器听写会有错字、漏句甚至串句，歌词文字只能当参考，结果会标「未校对」；<br>· 一首歌大约 1-2 分钟，期间请别关页面；<br>· 只能补「用本工具上传过、且上传历史里还有记录」的歌；<br>· 会替换当前' + (has ? '这 ' + has + ' 句歌词' : '歌词') + '，不想要可以再点「清除本机歌词」恢复联网歌词。</div>';
+  asrRefresh();
 }
-function closeStt(){ const b = $('sttBox'); if (b) b.style.display = 'none'; }
+function closeStt(){ const b = $('sttBox'); if (b) b.style.display = 'none'; if (asrTimer) { clearTimeout(asrTimer); asrTimer = null; } }
+// 语音识别组件: 没装时在面板里给一个下载按钮, 装好后隐藏
+let asrTimer = null;
+function asrPaint(s){
+  const box = $('sttAsr'), go = $('sttGo');
+  if (!box) return;
+  box.style.display = 'block';
+  if (s.ready) {
+    box.innerHTML = '<div style="opacity:.75">识别组件已就绪（' + (s.backend === 'cpp' ? '本机组件' : '开发环境') + '），无需再下载。</div>';
+  } else if (s.installing) {
+    const mb = n => (Number(n) / 1048576).toFixed(0);
+    const prog = s.total ? ' ' + Math.round(Number(s.loaded) * 100 / Number(s.total)) + '%（' + mb(s.loaded) + '/' + mb(s.total) + 'MB）' : (s.loaded ? ' ' + mb(s.loaded) + 'MB' : '');
+    box.innerHTML = '<div>正在' + esc(s.step || '下载') + prog + '…</div>' +
+      '<div style="opacity:.75;margin-top:2px">约 150MB，只需下载一次。下载期间可以正常上传，只是暂时不能补时间轴。</div>';
+  } else {
+    box.innerHTML = '<div>补时间轴需要再下载一个语音识别组件（约 150MB，含中文模型）。只在本机使用，不上传声音。</div>' +
+      (s.error ? '<div style="color:#ff8a80;margin-top:2px">上次安装失败：' + esc(s.error) + '</div>' : '') +
+      '<div style="margin-top:6px"><button class="mini primary" onclick="asrInstall()">下载识别组件</button></div>';
+  }
+  if (sttRunning || !go) return;
+  if (s.installing) { go.disabled = true; go.textContent = '组件下载中…'; }
+  else if (!s.ready) { go.disabled = true; go.textContent = '先下载组件'; }
+  else { go.disabled = false; go.textContent = '开始补时间轴'; }
+}
+async function asrRefresh(){
+  let s = null;
+  try { s = await (await fetch('/api/asr/status', { cache: 'no-store' })).json(); } catch (e) { return; }
+  asrPaint(s || {});
+  if (asrTimer) { clearTimeout(asrTimer); asrTimer = null; }
+  if (s && s.installing) asrTimer = setTimeout(asrRefresh, 1200);
+}
+async function asrInstall(){
+  const box = $('sttAsr');
+  if (box) box.innerHTML = '<div>正在连接下载服务器…</div>';
+  try {
+    const r = await (await fetch('/api/asr/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).json();
+    if (!r.ok) throw new Error(r.error || '组件下载启动失败');
+    asrRefresh();
+  } catch (e) {
+    if (box) box.innerHTML = '<div style="color:#ff8a80">✗ ' + esc(errMsg(e, '组件下载失败')) + '，请稍后重试。</div>';
+  }
+}
 let sttRunning = false;
 async function sttCancel(){
   // 识别中点「取消」= 真正停止后端进程; 空闲时只是收起面板
@@ -4071,7 +4660,7 @@ async function sttStart(){
       go.textContent = '再补一次';
     }
   } catch (e) {
-    push('✗ ' + (e && e.message ? e.message : '请求失败'));
+    push('✗ ' + errMsg(e, '请求失败'));
   }
   sttRunning = false;
   cancel.disabled = false; cancel.textContent = '取消';
@@ -4093,7 +4682,7 @@ async function sttUndo(){
     await loadLyric(t, a, lyrAudioDur);
     body.innerHTML = '<div>已清除本机歌词，正在使用联网歌词（没有就显示没找到）。</div>';
   } catch (e) {
-    body.innerHTML = '<div>✗ ' + esc(e && e.message ? e.message : '清除失败') + '</div>';
+    body.innerHTML = '<div>✗ ' + esc(errMsg(e, '清除失败')) + '</div>';
   }
 }
 async function ncmDirect(btn){
@@ -4451,9 +5040,9 @@ async function fixUpload(btn, song, row) {
       }
     });
   } catch (e) {
-    step('✗ ' + e.message, true);
+    step('✗ ' + errMsg(e, '补歌失败'), true);
     $('running').hidden = true; $('finished').hidden = false;
-    $('pDone').innerHTML = '补歌失败<span>' + esc(e.message.slice(0, 60)) + '</span>';
+    $('pDone').innerHTML = '补歌失败<span>' + esc(errMsg(e, '请稍后重试').slice(0, 60)) + '</span>';
   }
   if (ok) { btn.textContent = '已补'; } else { btn.disabled = false; btn.textContent = '补进云盘'; }
   fixRunning = false;
@@ -4496,6 +5085,15 @@ function toast(msg) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.hidden = true; }, 2200);
 }
+// 统一错误文案: 网络/解析类异常转成人话, 中文错误原样展示
+function errMsg(e, fallback) {
+  const s = String((e && e.message) || e || '').trim();
+  if (/Failed to fetch|NetworkError|Load failed|fetch failed/i.test(s)) return '连接失败, 请确认程序还在运行。';
+  if (/Unexpected token|JSON|parse/i.test(s)) return '返回的数据无法识别, 请刷新后重试。';
+  if (/timeout|超时/i.test(s)) return '等待超时, 请稍后再试。';
+  if (/[\u4e00-\u9fa5]/.test(s)) return s;
+  return fallback || '操作失败, 请稍后重试。';
+}
 // 快速上手弹窗: 按当前页面显示对应教程
 function openGuide(){
   const fix = curTab === 'fix';
@@ -4536,7 +5134,7 @@ async function confirmPick() {
     closePick(); refreshFixButtons(); loadList();
   } catch (e) {
     btn.disabled = false; btn.textContent = mode === 'add' ? '确认加入' : '确认取消爱心';
-    alert('操作失败: ' + e.message);
+    alert('操作失败: ' + errMsg(e, '请稍后重试'));
   }
 }
 $('grayList').addEventListener('click', e => {
@@ -4708,7 +5306,7 @@ async function openAppleShow(id, name) {
     renderEps();
   } catch (e) {
     appleEps = [];
-    box.innerHTML = '<div class="empty">' + esc(e.message || '单集读取失败') + '<br><button class="mini" data-act="backshow">返回节目</button></div>';
+    box.innerHTML = '<div class="empty">' + esc(errMsg(e, '单集读取失败')) + '<br><button class="mini" data-act="backshow">返回节目</button></div>';
   }
 }
 function showBiliLoginPrompt(box) {
@@ -4758,6 +5356,7 @@ function closeBiliPanel() {
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if (!$('guideModal').hidden) closeGuide();
+  else if (!$('coverModal').hidden) cancelCoverPick();
   else if (!$('listenModal').hidden) closeListen();
   else if (!$('srcModal').hidden) closeSrc();
   else if (!$('lyricModal').hidden) closeLyric();
@@ -4802,9 +5401,177 @@ async function pasteClipboard() {
   $('input').value = merged.join(', ');
   $('input').focus();
 }
-async function doUpload(split) {
+// ---------- 上传封面选择 ----------
+let coverItems = [], coverChoice = null, coverResolver = null, uploadCover = null;
+function cancelCoverPick() {
+  const r = coverResolver; coverResolver = null;
+  $('coverModal').hidden = true; lockScroll();
+  if (r) r(undefined);
+}
+function skipCoverPick() {
+  const r = coverResolver; coverResolver = null;
+  $('coverModal').hidden = true; lockScroll();
+  if (r) r(null);
+}
+function confirmCoverPick() {
+  if (!coverChoice) return;
+  const r = coverResolver; coverResolver = null;
+  $('coverModal').hidden = true; lockScroll();
+  if (r) r(coverChoice);
+}
+function paintCoverGrid(items) {
+  coverItems = items;
+  $('coverGrid').innerHTML = items.map((x, i) =>
+    '<div class="cover-item" data-i="' + i + '"><img src="' + esc(x.proxy) + '" loading="lazy" alt="" onerror="this.parentNode.hidden=true">'
+    + '<span class="cover-tag">' + esc(x.source) + '</span></div>').join('');
+}
+function selectCover(i) {
+  coverChoice = coverItems[i] ? { url: coverItems[i].url } : null;
+  $('coverCustom').hidden = true;
+  [...$('coverGrid').querySelectorAll('.cover-item')].forEach((el, idx) => el.classList.toggle('sel', idx === i));
+  $('coverYes').disabled = !coverChoice;
+}
+function selectCustomCover(dataUrl, name) {
+  coverChoice = { dataUrl };
+  [...$('coverGrid').querySelectorAll('.cover-item')].forEach(el => el.classList.remove('sel'));
+  $('coverCustom').hidden = false;
+  $('coverCustomImg').src = dataUrl;
+  $('coverCustomName').textContent = name || '本地图片';
+  $('coverYes').disabled = false;
+}
+function askCover(title, pic, artist) {
+  return new Promise(resolve => {
+    coverResolver = resolve;
+    coverItems = []; coverChoice = null;
+    $('coverYes').disabled = true;
+    $('coverCustom').hidden = true;
+    $('coverTitle').textContent = title ? '「' + title + '」选封面' : '选择封面';
+    $('coverSub').textContent = pic ? '可以用当前音源的封面，也可以在本地选一张。' : '可以自己上传一张，或者直接不用封面。';
+    if (!pic) {
+      $('coverGrid').innerHTML = '<div class="cover-empty">这首歌没有自带封面，点下方的「本地上传图片」选一张，或直接不用封面。</div>';
+      $('coverModal').hidden = false; lockScroll();
+      return;
+    }
+    $('coverGrid').innerHTML = '<div class="cover-empty">正在读取封面...</div>';
+    $('coverModal').hidden = false; lockScroll();
+    fetch('/api/cover/search?pic=' + encodeURIComponent(pic))
+      .then(r => r.json()).then(j => {
+        if (!coverResolver) return;
+        const items = (j && j.items) || [];
+        if (!items.length) {
+          $('coverGrid').innerHTML = '<div class="cover-empty">没有读到封面，可以点「本地上传图片」，或者直接不用封面。</div>';
+          return;
+        }
+        paintCoverGrid(items);
+        selectCover(0);
+      }).catch(() => {
+        if (coverResolver) $('coverGrid').innerHTML = '<div class="cover-empty">读取封面失败，可以本地上传图片。</div>';
+      });
+  });
+}
+$('coverGrid').addEventListener('click', e => {
+  const it = e.target.closest('.cover-item'); if (!it) return;
+  selectCover(+it.dataset.i);
+});
+$('coverFile').addEventListener('change', e => {
+  const f = e.target.files && e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  if (!/^image\\/(jpeg|png)$/.test(f.type)) { alert('只支持 JPG / PNG 图片'); return; }
+  if (f.size > 5 * 1024 * 1024) { alert('图片请小于 5MB'); return; }
+  const rd = new FileReader();
+  rd.onload = () => selectCustomCover(rd.result, f.name);
+  rd.readAsDataURL(f);
+});
+
+// ---------- 留声机: 本地音频上传 ----------
+let localFile = null;
+const LOCAL_EXTS = ['mp3', 'm4a', 'aac', 'flac', 'ogg', 'wav'];
+function setLocalFile(f) {
+  if (!f) return;
+  const ext = f.name.toLowerCase().split('.').pop();
+  if (!LOCAL_EXTS.includes(ext)) { alert('只支持 MP3 / M4A / FLAC / AAC / OGG / WAV 音频'); return; }
+  if (f.size > 200 * 1024 * 1024) { alert('文件超过 200MB，请先压缩或切分'); return; }
+  localFile = f;
+  $('localName').textContent = f.name;
+  $('localHint').textContent = (f.size / 1048576).toFixed(1) + 'MB · 已就绪';
+}
+$('localFile').addEventListener('change', e => setLocalFile(e.target.files && e.target.files[0]));
+['dragenter', 'dragover'].forEach(ev => $('localDrop').addEventListener(ev, e => { e.preventDefault(); $('localDrop').classList.add('on'); }));
+['dragleave', 'drop'].forEach(ev => $('localDrop').addEventListener(ev, e => { e.preventDefault(); $('localDrop').classList.remove('on'); }));
+$('localDrop').addEventListener('drop', e => setLocalFile(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]));
+
+async function doLocalUpload() {
+  if (!localFile) { $('localFile').click(); return; }
+  const nm = localFile.name;
+  const dot = nm.lastIndexOf('.');
+  const base = dot > 0 ? nm.slice(0, dot) : nm;
+  const title = $('localSong').value.trim() || base;
+  const picked = await askCover(title, '', $('localArtist').value.trim());
+  if (picked === undefined) return;
+  const btn = $('localGo');
+  btn.disabled = true; btn.textContent = '上传中';
+  resetProgress('正在上传本地音频');
+  try {
+    let token = '';
+    if (picked && picked.dataUrl) {
+      step('正在准备封面...');
+      const cr = await fetch('/api/local/cover', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cover: { dataUrl: picked.dataUrl } }),
+      });
+      const cj = await cr.json();
+      if (!cj.ok) throw new Error(cj.error || '封面准备失败');
+      token = cj.token;
+    }
+    const qs = '?name=' + encodeURIComponent(nm)
+      + '&song=' + encodeURIComponent($('localSong').value.trim())
+      + '&artist=' + encodeURIComponent($('localArtist').value.trim())
+      + '&album=' + encodeURIComponent($('localAlbum').value.trim())
+      + '&clean=' + ($('localClean').checked ? '1' : '0')
+      + '&token=' + encodeURIComponent(token);
+    const res = await fetch('/api/local/upload' + qs, {
+      method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: localFile,
+    });
+    await readUploadStream(res, j => {
+      if (j.type === 'done') {
+        $('pBar').style.width = '100%';
+        $('running').hidden = true; $('finished').hidden = false;
+        $('pDone').innerHTML = '上传完成<span>已加入云盘</span>';
+        loadList(); loadHistory();
+      } else if (j.type === 'error') {
+        $('running').hidden = true; $('finished').hidden = false;
+        step('✗ ' + j.msg, true);
+        $('pDone').innerHTML = '上传失败<span>请查看错误信息</span>';
+      } else {
+        step(j.msg); phaseBar(j.msg);
+      }
+    });
+  } catch (e) {
+    step('✗ ' + errMsg(e, '上传失败'), true);
+    $('running').hidden = true; $('finished').hidden = false;
+    $('pDone').innerHTML = '上传失败<span>' + esc(errMsg(e, '请稍后重试').slice(0, 80)) + '</span>';
+  }
+  btn.disabled = false; btn.textContent = '上传到云盘';
+}
+
+async function doUpload(split, skipCover) {
   const input = $('input').value.trim();
   if (!input) { $('input').focus(); return; }
+  if (!skipCover) {
+    uploadCover = null;
+    const tokens = input.split(/[\\n,，、]+/).map(s => s.trim()).filter(Boolean);
+    if (tokens.length === 1) {
+      let title = $('song').value.trim(), pic = '', artist = $('artist').value.trim();
+      try {
+        const j = await (await fetch('/api/cover/meta?input=' + encodeURIComponent(tokens[0]))).json();
+        if (j.ok) { title = title || j.title || ''; pic = j.pic || ''; artist = artist || j.artist || ''; }
+      } catch (e) {}
+      const picked = await askCover(title, pic, artist);
+      if (picked === undefined) return;
+      uploadCover = picked;
+    }
+  }
   split = split === true;
   const btn = $('go');
   btn.disabled = true; btn.textContent = '上传中';
@@ -4813,7 +5580,8 @@ async function doUpload(split) {
   try {
     const res = await fetch('/api/upload', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ input, type: curType, allPages: true, split, season: $('season').checked,
-        clean: $('clean').checked, song: $('song').value.trim(), artist: $('artist').value.trim() }) });
+        clean: $('clean').checked, song: $('song').value.trim(), artist: $('artist').value.trim(),
+        cover: uploadCover }) });
     await readUploadStream(res, j => {
       if (j.type === 'done') {
         const ok = j.results.filter(r => r.ok).length;
@@ -4845,9 +5613,9 @@ async function doUpload(split) {
       }
     });
   } catch (e) {
-    step('✗ ' + e.message, true);
+    step('✗ ' + errMsg(e, '上传失败'), true);
     $('running').hidden = true; $('finished').hidden = false;
-    $('pDone').innerHTML = '上传失败<span>' + esc(e.message.slice(0, 80)) + '</span>';
+    $('pDone').innerHTML = '上传失败<span>' + esc(errMsg(e, '请稍后重试').slice(0, 80)) + '</span>';
   }
   btn.disabled = false; btn.textContent = '上传';
 }
@@ -4856,7 +5624,7 @@ try {
   const savedTab = localStorage.getItem('GraySongICU.tab') || 'fix';
   const savedType = localStorage.getItem('GraySongICU.type');
   curType = savedType === 'pod' ? 'pod' : 'music';
-  switchTab(savedTab === 'fix' ? 'fix' : 'up');
+  switchTab(savedTab === 'local' ? 'local' : (savedTab === 'fix' ? 'fix' : 'up'));
   switchType(curType);
 } catch (e) { switchTab('fix'); }
 </script>
@@ -5489,7 +6257,7 @@ async function ncmQrPoll(key) {
 }
 
 // ---------- 服务器 ----------
-http.createServer((rq, rs) => {
+function handleRequest(rq, rs) {
   const url = rq.url.split('?')[0];
   if (rq.method === 'GET' && url === '/') {
     rs.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -5501,8 +6269,9 @@ http.createServer((rq, rs) => {
         rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         rs.end(JSON.stringify({ ncm, bili: /SESSDATA/.test(readBiliCookie()) }));
       }).catch(e => {
+        logError('status', e);
         rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        rs.end(JSON.stringify({ ncm: { ok: false, timeout: /检测超时/.test(e.message), error: e.message }, bili: /SESSDATA/.test(readBiliCookie()) }));
+        rs.end(JSON.stringify({ ncm: { ok: false, timeout: /检测超时/.test(e.message), error: friendlyError(e) }, bili: /SESSDATA/.test(readBiliCookie()) }));
       });
     return;
   }
@@ -5511,7 +6280,11 @@ http.createServer((rq, rs) => {
       const text = new URL(rq.url, 'http://x').searchParams.get('text') || '';
       rs.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'no-store' });
       rs.end(qrSvg(text));
-    } catch (e) { rs.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }); rs.end(e.message); }
+    } catch (e) {
+      logError('qr', e);
+      rs.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      rs.end('二维码生成失败, 请刷新重试。');
+    }
     return;
   }
   for (const kind of ['bili', 'ncm']) {
@@ -5521,7 +6294,7 @@ http.createServer((rq, rs) => {
         try {
           const j = await (kind === 'bili' ? biliQrCreate() : ncmQrCreate());
           rs.end(JSON.stringify({ ok: true, text: j.text, key: j.key }));
-        } catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+        } catch (e) { fail(rs, e); }
       })();
       return;
     }
@@ -5531,7 +6304,10 @@ http.createServer((rq, rs) => {
       (async () => {
         try {
           rs.end(JSON.stringify(await (kind === 'bili' ? biliQrPoll(key) : ncmQrPoll(key))));
-        } catch (e) { rs.end(JSON.stringify({ state: 'error', error: e.message })); }
+        } catch (e) {
+          logError('qr', e);
+          rs.end(JSON.stringify({ state: 'error', error: friendlyError(e) }));
+        }
       })();
       return;
     }
@@ -5552,8 +6328,7 @@ http.createServer((rq, rs) => {
         rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         rs.end(JSON.stringify({ ok: true }));
       } catch (e) {
-        rs.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-        rs.end(JSON.stringify({ ok: false, error: e.message }));
+        fail(rs, e);
       }
     });
     return;
@@ -5563,8 +6338,7 @@ http.createServer((rq, rs) => {
       rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       rs.end(JSON.stringify(j));
     }).catch(e => {
-      rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      rs.end(JSON.stringify({ count: 0, size: 0, songs: [], error: e.message }));
+      fail(rs, e, { count: 0, size: 0, songs: [] });
     });
     return;
   }
@@ -5579,8 +6353,7 @@ http.createServer((rq, rs) => {
       rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       rs.end(JSON.stringify({ ok: true }));
     } catch (e) {
-      rs.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-      rs.end(JSON.stringify({ ok: false, error: e.message }));
+      fail(rs, e);
     }
     return;
   }
@@ -5588,7 +6361,7 @@ http.createServer((rq, rs) => {
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     (async () => {
       try { rs.end(JSON.stringify({ playlists: await ncmPlaylists() })); }
-      catch (e) { rs.end(JSON.stringify({ playlists: [], error: e.message })); }
+      catch (e) { fail(rs, e, { playlists: [] }); }
     })();
     return;
   }
@@ -5596,7 +6369,7 @@ http.createServer((rq, rs) => {
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     (async () => {
       try { rs.end(JSON.stringify(await ncmSide())); }
-      catch (e) { rs.end(JSON.stringify({ liked: [], rec: [], error: e.message })); }
+      catch (e) { fail(rs, e, { liked: [], rec: [] }); }
     })();
     return;
   }
@@ -5701,7 +6474,7 @@ http.createServer((rq, rs) => {
             current: !!(cur && cur.songId && String(cur.songId) === String(c.song.id)),
           })),
         }));
-      } catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+      } catch (e) { fail(rs, e); }
     })();
     return;
   }
@@ -5733,7 +6506,22 @@ http.createServer((rq, rs) => {
           liveLoad(live.key, live.title, live.artist, pushFresh() ? pushState.dur : 0);
         }
         rs.end(JSON.stringify({ ok: true, songId, lines: v.lines, name: String(o.name || title) }));
-      } catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+      } catch (e) { fail(rs, e); }
+    });
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/asr/status') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    rs.end(JSON.stringify(asrStatus()));
+    return;
+  }
+  if (rq.method === 'POST' && url === '/api/asr/install') {
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    let body = '';
+    rq.on('data', d => body += d);
+    rq.on('end', async () => {
+      try { rs.end(JSON.stringify(await installAsrPack())); }
+      catch (e) { fail(rs, e); }
     });
     return;
   }
@@ -5752,7 +6540,8 @@ http.createServer((rq, rs) => {
         rs.end(JSON.stringify({ type: 'done', ...r }) + '\n');
       } catch (e) {
         if (e.message === '__canceled__') return rs.end(JSON.stringify({ type: 'canceled' }) + '\n');
-        rs.end(JSON.stringify({ type: 'error', msg: e.message }) + '\n');
+        logError('lyric', e);
+        rs.end(JSON.stringify({ type: 'error', msg: friendlyError(e) }) + '\n');
       }
     });
     return;
@@ -5780,7 +6569,7 @@ http.createServer((rq, rs) => {
           liveLoad(live.key, live.title, live.artist, pushFresh() ? pushState.dur : 0);
         }
         rs.end(JSON.stringify({ ok: true }));
-      } catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+      } catch (e) { fail(rs, e); }
     });
     return;
   }
@@ -5814,7 +6603,7 @@ http.createServer((rq, rs) => {
     if (rq.method === 'OPTIONS') return rs.end('{}');
     (async () => {
       try { rs.end(JSON.stringify(Object.assign({ ok: true }, await ncmRelaunch()))); }
-      catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+      catch (e) { fail(rs, e); }
     })();
     return;
   }
@@ -5827,7 +6616,7 @@ http.createServer((rq, rs) => {
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
     if (rq.method === 'OPTIONS') return rs.end('{}');
     try { rs.end(JSON.stringify({ ok: true, path: installBridgePlugin(), installed: true, needRestart: true })); }
-    catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+    catch (e) { fail(rs, e); }
     return;
   }
   if (url === '/api/plugin/source') {
@@ -5846,13 +6635,13 @@ http.createServer((rq, rs) => {
         try {
           const c = await ncmSongCands(title, artist);
           rs.end(JSON.stringify({ ok: true, cands: c.slice(0, 12).map(x => ({ name: x.song.name, artist: x.artist, score: x.sc, dur: x.song.dt })) }));
-        } catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+        } catch (e) { fail(rs, e); }
       })();
       return;
     }
     (async () => {
       try { rs.end(JSON.stringify(await lyricFor(title, artist, Number(sp.get('dur')) || 0))); }
-      catch (e) { rs.end(JSON.stringify({ ok: false, error: e.message })); }
+      catch (e) { fail(rs, e); }
     })();
     return;
   }
@@ -5862,7 +6651,7 @@ http.createServer((rq, rs) => {
       try {
         rs.end(JSON.stringify(await ocrPlayPos()));
       } catch (e) {
-        rs.end(JSON.stringify({ ok: false, error: e.message || '校准失败' }));
+        fail(rs, e, { error: friendlyError(e) });
       }
     })();
     return;
@@ -5873,7 +6662,7 @@ http.createServer((rq, rs) => {
     if (!/^\d+$/.test(pid)) return rs.end(JSON.stringify({ songs: [], total: 0, error: '请选择歌单' }));
     (async () => {
       try { rs.end(JSON.stringify(await scanPlaylist(pid))); }
-      catch (e) { rs.end(JSON.stringify({ songs: [], total: 0, error: e.message })); }
+      catch (e) { fail(rs, e, { songs: [], total: 0 }); }
     })();
     return;
   }
@@ -5889,7 +6678,7 @@ http.createServer((rq, rs) => {
         const j = await editPlaylistTracks({ op: o.op === 'del' ? 'del' : 'add', pid: o.pid, ids });
         rs.end(JSON.stringify({ ok: true, playlistId: j.id, count: j.count }));
       } catch (e) {
-        rs.end(JSON.stringify({ ok: false, error: e.message }));
+        fail(rs, e);
       }
     });
     return;
@@ -5903,7 +6692,7 @@ http.createServer((rq, rs) => {
       try {
         rs.end(JSON.stringify({ items: await biliSearch(kw) }));
       } catch (e) {
-        rs.end(JSON.stringify({ items: [], error: e.message }));
+        fail(rs, e, { items: [] });
       }
     })();
     return;
@@ -5915,7 +6704,7 @@ http.createServer((rq, rs) => {
     if (!bvids.length) return rs.end(JSON.stringify({ items: [] }));
     (async () => {
       try { rs.end(JSON.stringify({ items: await biliQualityBatch(bvids) })); }
-      catch (e) { rs.end(JSON.stringify({ items: [], error: e.message })); }
+      catch (e) { fail(rs, e, { items: [] }); }
     })();
     return;
   }
@@ -5949,8 +6738,132 @@ http.createServer((rq, rs) => {
         rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         rs.end(JSON.stringify({ ok: j.code === 200, resp: j }));
       } catch (e) {
-        rs.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
-        rs.end(JSON.stringify({ ok: false, error: e.message }));
+        fail(rs, e);
+      }
+    });
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/cover/search') {
+    const sp = new URL(rq.url, 'http://x').searchParams;
+    const pic = (sp.get('pic') || '').trim();
+    findCovers(pic).then(items => {
+      rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      rs.end(JSON.stringify({ ok: true, items }));
+    }).catch(e => fail(rs, e));
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/cover/img') {
+    const target = (new URL(rq.url, 'http://x').searchParams.get('url') || '').trim();
+    let ref = 'https://image.baidu.com/';
+    try {
+      const h = new URL(target).hostname;
+      if (/bilibili|hdslb|biliimg/i.test(h)) ref = 'https://www.bilibili.com/';
+      else if (/music\.126\.net/i.test(h)) ref = 'https://music.163.com/';
+    } catch (e) {}
+    fetchCoverBuffer(target, ref).then(buf => {
+      rs.writeHead(200, { 'Content-Type': imageMime(buf) || 'image/jpeg', 'Cache-Control': 'max-age=3600' });
+      rs.end(buf);
+    }).catch(e => { rs.writeHead(404); rs.end(''); });
+    return;
+  }
+  if (rq.method === 'GET' && url === '/api/cover/meta') {
+    const input = (new URL(rq.url, 'http://x').searchParams.get('input') || '').trim();
+    (async () => {
+      let title = '', pic = '', artist = '';
+      try {
+        const bv = (input.match(/BV[0-9A-Za-z]{10}/) || [])[0];
+        const pod = parsePodcast(input);
+        if (bv) {
+          const H = await biliHeaders();
+          const v = await getJSON(`https://api.bilibili.com/x/web-interface/view?bvid=${bv}`, H, 15000);
+          title = (v.data && v.data.title) || '';
+          pic = (v.data && v.data.pic) || '';
+          // 用整理后的歌名去搜图, 比原始视频标题准得多; 顺带拿到歌手用于找歌手照片
+          const cn = title ? cleanSongName(title) : null;
+          if (cn) { title = cn.song; artist = cn.artist || ''; }
+        } else if (pod && pod.kind === 'apple') {
+          const list = await appleEpisodes(pod.collectionId);
+          const ep = pod.episodeId ? list.find(x => x.episodeId === pod.episodeId) : list[0];
+          if (ep) { title = ep.name; pic = ep.artwork || ''; }
+        } else if (pod && pod.kind === 'xiaoyuzhou') {
+          const page = await req('GET', pod.url, { 'User-Agent': UA, 'Referer': 'https://www.xiaoyuzhoufm.com/' });
+          const meta = {};
+          for (const m of page.text.matchAll(/<meta[^>]+(?:property|name)="(og:[^"]+)"[^>]*content="([^"]*)"/g)) meta[m[1]] = m[2];
+          title = decodeEntities(meta['og:title'] || '');
+          pic = meta['og:image'] || '';
+        } else if (/^https?:\/\//i.test(input)) {
+          const n = decodeURIComponent((input.split('?')[0].split('/').pop() || '')).replace(/\.[a-z0-9]+$/i, '');
+          title = n || '';
+        }
+      } catch (e) { logError('cover', e); }
+      if (pic.startsWith('//')) pic = 'https:' + pic;
+      rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      rs.end(JSON.stringify({ ok: true, title, pic: pic.startsWith('//') ? 'https:' + pic : pic, artist }));
+    })();
+    return;
+  }
+  // ---------- 留声机: 本地上传 ----------
+  // 封面分两步: 先上传图片拿 token, 再传音频(避免把图片塞进查询串)
+  if (rq.method === 'POST' && url === '/api/local/cover') {
+    let body = '';
+    rq.on('data', d => body += d);
+    rq.on('end', async () => {
+      rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      try {
+        const o = JSON.parse(body || '{}');
+        const cover = await resolveCover(o.cover);
+        if (!cover) throw new Error('图片读取失败, 请换一张试试');
+        const token = crypto.randomBytes(12).toString('hex');
+        const now = Date.now();
+        for (const [k, v] of localCovers) if (now - v.at > 10 * 60 * 1000) localCovers.delete(k);
+        localCovers.set(token, { buffer: cover.buffer, mime: cover.mime, at: now });
+        rs.end(JSON.stringify({ ok: true, token }));
+      } catch (e) { fail(rs, e); }
+    });
+    return;
+  }
+  if (rq.method === 'POST' && url === '/api/local/upload') {
+    const sp = new URL(rq.url, 'http://x').searchParams;
+    const name = sp.get('name') || 'audio';
+    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    const send = msg => { try { rs.write(JSON.stringify({ type: 'log', msg }) + '\n'); } catch (e) {} };
+    const chunks = [];
+    let size = 0, tooBig = false;
+    rq.on('data', d => {
+      size += d.length;
+      if (size > MAX_CLOUD_BYTES) { tooBig = true; chunks.length = 0; return; }
+      chunks.push(d);
+    });
+    rq.on('end', async () => {
+      try {
+        if (tooBig) throw new Error('文件超过 200MB, 请先压缩或切分后再传');
+        const buffer = Buffer.concat(chunks);
+        if (!buffer.length) throw new Error('没有读取到音频内容');
+        const ext = (name.toLowerCase().match(/\.(mp3|m4a|aac|flac|ogg|wav)$/) || [])[1] || '';
+        if (!ext) throw new Error('只支持 MP3 / M4A / FLAC / AAC / OGG / WAV 音频');
+        let song = (sp.get('song') || '').trim();
+        let artist = (sp.get('artist') || '').trim();
+        const album = (sp.get('album') || '').trim();
+        const base = name.replace(/\.(mp3|m4a|aac|flac|ogg|wav)$/i, '');
+        if (sp.get('clean') === '1' && !song) {
+          const cn = cleanSongName(base);
+          if (cn) { song = cn.song || ''; artist = artist || cn.artist || ''; }
+        }
+        song = song || base || 'audio';
+        let cover = null;
+        const cv = localCovers.get(sp.get('token') || '');
+        if (cv) { localCovers.delete(sp.get('token')); cover = { buffer: cv.buffer, mime: cv.mime }; }
+        if (cover && !/^(mp3|m4a)$/.test(ext)) { cover = null; send('该格式暂不支持写入封面, 已跳过'); }
+        send('正在读取本地音频 (' + (buffer.length / 1048576).toFixed(2) + 'MB)...');
+        const up = await uploadBuffer({
+          buffer, ext, filename: sanitize(song) + '.' + ext, song, artist, album,
+          contentType: contentTypeFor(ext), send, cover,
+        });
+        appendHistory({ input: name, song, artist, ok: true, songId: up.songId });
+        rs.end(JSON.stringify({ type: 'done', results: [{ ok: true, song, songId: up.songId }] }) + '\n');
+      } catch (e) {
+        logError('local', e);
+        try { rs.end(JSON.stringify({ type: 'error', msg: friendlyError(e) }) + '\n'); } catch (_) {}
       }
     });
     return;
@@ -5964,13 +6877,15 @@ http.createServer((rq, rs) => {
       const send = msg => { try { rs.write(JSON.stringify({ type: 'log', msg }) + '\n'); } catch (e) {} };
       try {
         const opts = JSON.parse(body);
+        opts.cover = await resolveCover(opts.cover);
         // 多任务: input 可为字符串(空白/逗号分隔多个链接或BV号)或数组, 含合集页链接时自动走合集模式
         const inputs = parseInputs(opts.input);
         if (!inputs.length) throw new Error('未提供视频链接或BV号');
         const results = await runJobs(inputs, opts, send);
         rs.end(JSON.stringify({ type: 'done', results }) + '\n');
       } catch (e) {
-        rs.end(JSON.stringify({ type: 'error', msg: e.message, needSplit: e.needSplit || null }) + '\n');
+        logError('upload', e);
+        rs.end(JSON.stringify({ type: 'error', msg: friendlyError(e), needSplit: e.needSplit || null }) + '\n');
       }
     });
     return;
@@ -6003,20 +6918,36 @@ http.createServer((rq, rs) => {
     if (rq.method === 'POST') {
       let body = '';
       rq.on('data', d => body += d);
-      rq.on('end', () => {
+      rq.on('end', async () => {
         let action = 'open';
         try { action = JSON.parse(body || '{}').action || 'open'; } catch (e) {}
-        const out = action === 'close' ? closeLyricWindow() : openLyricWindow();
-        rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        rs.end(JSON.stringify(out));
+        try {
+          const out = action === 'close' ? await closeLyricWindow() : await openLyricWindow();
+          rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          rs.end(JSON.stringify(out));
+        } catch (e) { fail(rs, e); }
       });
       return;
     }
-    rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-    rs.end(JSON.stringify({ ok: true, running: lyricWindowRunning(), installing: lyricInstalling }));
+    lyricWindowState().then(st => {
+      rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      rs.end(JSON.stringify({ ok: true, running: st.running, installing: st.installing }));
+    }).catch(e => fail(rs, e));
     return;
   }
   rs.writeHead(404); rs.end('not found');
+}
+http.createServer((rq, rs) => {
+  try {
+    handleRequest(rq, rs);
+  } catch (e) {
+    // 兜底: 任何未预料的同步异常都不把堆栈丢给用户
+    logError('request', e);
+    try {
+      if (!rs.headersSent) rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      if (!rs.writableEnded) rs.end(JSON.stringify({ ok: false, error: friendlyError(e) }));
+    } catch (_) { /* 连接已断开 */ }
+  }
 }).listen(PORT, HOST, () => {
   console.log(`GraySongICU 已启动: http://${HOST}:${PORT}`);
   console.log('免责声明: 仅供技术学习与个人使用, 云盘内容仅限本人收听');
@@ -6024,3 +6955,6 @@ http.createServer((rq, rs) => {
   const ncmTimer = setInterval(ncmWatchdog, 6000);
   if (ncmTimer.unref) ncmTimer.unref();
 });
+// 进程级兜底: 未捕获异常只写日志, 不让服务直接退出
+process.on('uncaughtException', e => logError('uncaught', e));
+process.on('unhandledRejection', e => logError('unhandled', e));
