@@ -4,8 +4,10 @@ const path = require('path');
 const fs = require('fs');
 
 const APP_URL = 'http://127.0.0.1:3210/desktop-lyrics';
-// 本机调试用: 9223 端口可连 CDP 检查歌词窗的命中测试
-app.commandLine.appendSwitch('remote-debugging-port', '9223');
+// 调试时才开 CDP, 正式运行不暴露调试端口
+if (process.env.GRAYSONGICU_DEBUG_CDP) {
+  app.commandLine.appendSwitch('remote-debugging-port', process.env.GRAYSONGICU_DEBUG_CDP);
+}
 let win = null;
 let tray = null;
 let locked = false;

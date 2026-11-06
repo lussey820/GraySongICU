@@ -1,9 +1,13 @@
 # 凭证文件 — 永远不要提交
 cookie.txt
 bilibili_cookie.txt
+cookie.enc
 
 # 本地上传历史 (含个人使用记录)
 history.json
+
+# 本地补歌词历史 (含个人使用记录)
+lyric-history.json
 
 # 本地歌词索引 (含个人使用记录)
 lyrics.json
@@ -23,12 +27,14 @@ node_modules/
 .DS_Store
 
 # 运行日志
+main.log
 server.out.log
 server.err.log
 server.log
 lyric-window.json
 
-# Electron 打包产物
+# Electron 依赖与打包产物
+electron/node_modules/
 electron/dist/
 
 # 本地语音模型与环境 (体积大, 不入库)
@@ -36,6 +42,9 @@ asr/models/
 asr/.venv/
 asr/__pycache__/
 asr-pack/
+
+# 内嵌的 ffmpeg 可执行文件 (体积大, 不入库)
+bin/ffmpeg.exe
 
 # 本地协作工具产物 (设计参考稿/助手记忆, 非项目本体)
 .workbuddy/
