@@ -2572,7 +2572,7 @@ async function whisperFileToLyric(tmp, durSec, title, artist, send, extra) {
   const started = Date.now();
   if (sttBusy) { try { fs.unlinkSync(tmp); } catch (e) {} throw new Error('本地识别正在忙, 请稍后再试'); }
   const a = asrReady();
-  if (!a.ready) { try { fs.unlinkSync(tmp); } catch (e) {} throw new Error('还没有安装语音识别组件, 请点右上角「歌词」→ 底部「补时间轴」下载'); }
+  if (!a.ready) { try { fs.unlinkSync(tmp); } catch (e) {} throw new Error('还没有安装「离线补歌词」，该功能暂且不能使用'); }
   sttBusy = true;
   try {
     let segments = null;
@@ -2626,7 +2626,7 @@ async function whisperFileToLyric(tmp, durSec, title, artist, send, extra) {
 }
 async function sttLyricForSong(title, artist, send, pre) {
   const asr = asrReady();
-  if (!asr.ready) throw new Error('还没有安装语音识别组件, 请点右上角「歌词」→ 底部「补时间轴」下载');
+  if (!asr.ready) throw new Error('还没有安装「离线补歌词」，该功能暂且不能使用');
   // 拆分上传的分段只有一段音频, 拿整首时间轴会错位, 直接拒绝, 不写脏数据
   if (/[（(]\d+\s*\/\s*\d+[）)]/.test(title)) {
     throw new Error('这是超过 200MB 拆分上传的分段，时间轴无法可靠对齐，暂不支持补时间轴；请用完整的那一首');
@@ -4893,20 +4893,20 @@ function asrPaint(s){
   if (!box) return;
   box.style.display = 'block';
   if (s.ready) {
-    box.innerHTML = '<div style="opacity:.75">识别组件已就绪（' + (s.backend === 'cpp' ? '本机组件' : '开发环境') + '），无需再下载。</div>';
+    box.innerHTML = '<div style="opacity:.75">离线补歌词已就绪。</div>';
   } else if (s.installing) {
     const mb = n => (Number(n) / 1048576).toFixed(0);
     const prog = s.total ? ' ' + Math.round(Number(s.loaded) * 100 / Number(s.total)) + '%（' + mb(s.loaded) + '/' + mb(s.total) + 'MB）' : (s.loaded ? ' ' + mb(s.loaded) + 'MB' : '');
-    box.innerHTML = '<div>正在' + esc(s.step || '下载') + prog + '…</div>' +
-      '<div style="opacity:.75;margin-top:2px">约 150MB，只需下载一次。下载期间可以正常上传，只是暂时不能补时间轴。</div>';
+    box.innerHTML = '<div>正在下载离线补歌词组件' + prog + '…</div>' +
+      '<div style="opacity:.75;margin-top:2px">约 150MB，只需下载一次。</div>';
   } else {
-    box.innerHTML = '<div>补时间轴需要再下载一个语音识别组件（约 150MB，含中文模型）。只在本机使用，不上传声音。</div>' +
+    box.innerHTML = '<div>还没有安装「离线补歌词」，该功能暂且不能使用。</div>' +
       (s.error ? '<div style="color:#ff8a80;margin-top:2px">上次安装失败：' + esc(s.error) + '</div>' : '') +
       '<div style="margin-top:6px"><button class="mini primary" onclick="asrInstall()">下载识别组件</button></div>';
   }
   if (sttRunning || !go) return;
   if (s.installing) { go.disabled = true; go.textContent = '组件下载中…'; }
-  else if (!s.ready) { go.disabled = true; go.textContent = '先下载组件'; }
+  else if (!s.ready) { go.disabled = true; go.textContent = '组件未安装'; }
   else { go.disabled = false; go.textContent = '开始补时间轴'; }
 }
 async function asrRefresh(){

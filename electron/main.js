@@ -27,7 +27,6 @@ const LYRIC_STATE = path.join(DATA_DIR, 'lyric-window.json');
 // 离线歌词组件默认放在用户数据目录, 避免安装到 Program Files 后无写权限
 const EXE_DIR = path.dirname(process.execPath);
 const ASR_PACK_DIR = IS_PACKAGED ? path.join(DATA_DIR, 'asr-pack') : '';
-const ASR_ASKED = IS_PACKAGED ? path.join(DATA_DIR, '.asr-asked') : '';
 // 安装器里勾选了「离线补歌词」时写入的标记, 首次启动看到就自动下载
 const ASR_REQUEST = IS_PACKAGED ? path.join(EXE_DIR, '.asr-request') : '';
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
@@ -494,38 +493,11 @@ async function startInstallAsr() {
 }
 async function askInstallAsr() {
   if (!IS_PACKAGED) return;
-  if (asrInstalled()) {
-    // 安装器可能勾选过离线组件, 但本机已经有了, 清掉标记避免残留
-    if (ASR_REQUEST && fs.existsSync(ASR_REQUEST)) {
-      try { fs.unlinkSync(ASR_REQUEST); } catch (e) {}
-    }
-    return;
-  }
-  // 安装器里勾选过「离线补歌词」: 首次启动不再追问, 直接开始下载
-  if (ASR_REQUEST && fs.existsSync(ASR_REQUEST)) {
-    logLine('安装时已勾选离线补歌词, 自动开始下载');
-    try { fs.unlinkSync(ASR_REQUEST); } catch (e) {}
-    try { fs.writeFileSync(ASR_ASKED, ''); } catch (e) {}
-    return startInstallAsr();
-  }
-  if (fs.existsSync(ASR_ASKED)) return;
-  logLine('首次启动: 询问是否安装离线补歌词组件');
-  const r = await msgBox({
-    type: 'question',
-    title: '离线补歌词（可选）',
-    message: '要不要安装「离线补歌词」？',
-    detail: '有些歌没有歌词。安装后可以让电脑自己听一遍，补上歌词和时间轴。\n\n'
-      + '大约 150MB，只下载一次，保存在用户数据目录。\n\n'
-      + '现在不装也没关系，上传、音质和正常歌词都不受影响。',
-    buttons: ['现在安装（约 150MB）', '以后再说'],
-    defaultId: 0, cancelId: 1, noLink: true,
-  });
-  if (r.response !== 0) {
-    logLine('用户选择: 以后再说');
-    try { fs.writeFileSync(ASR_ASKED, ''); } catch (e) {}
-    return;
-  }
-  logLine('用户选择: 安装离线补歌词组件');
+  // 安装器里勾选了「离线补歌词」才会走到这里; 没勾选就不打扰, 用的时候再在面板里装
+  if (!ASR_REQUEST || !fs.existsSync(ASR_REQUEST)) return;
+  try { fs.unlinkSync(ASR_REQUEST); } catch (e) {}
+  if (asrInstalled()) return;
+  logLine('安装时已勾选离线补歌词, 自动开始下载');
   return startInstallAsr();
 }
 
