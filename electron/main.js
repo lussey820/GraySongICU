@@ -529,7 +529,8 @@ function relaunchAfterInstall(installer) {
     'if (Test-Path $exe) { Start-Process -FilePath $exe }',
   ];
   const file = path.join(app.getPath('temp'), 'gsi-update-watchdog-' + Date.now() + '.ps1');
-  fs.writeFileSync(file, lines.join('\r\n'), 'utf8');
+  // 带 BOM, 避免用户名含中文时 PowerShell 5 按 ANSI 读错路径
+  fs.writeFileSync(file, '\uFEFF' + lines.join('\r\n'), 'utf8');
   try {
     const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', file], {
       detached: true, stdio: 'ignore', windowsHide: true,
