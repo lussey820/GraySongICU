@@ -5384,20 +5384,39 @@ function openPick(mode) {
   lockScroll();
 }
 function closePick(){ $('pickModal').hidden = true; lockScroll(); }
-// 更新: 启动时静默检查一次, 有新版就在按钮上点个红点; 点按钮 = 下载并重启安装
-let updPending = null;
+// 更新: 每天早上 7 点自动检查一次(应用一直开着也会按时查), 有新版就在按钮上点个红点
+const UPD_KEY = 'gsi_upd_check_at';
+let updPending = null, updTimer = 0;
 function updDot(on, tip) {
   const d = $('updDot'), btn = $('updBtn');
   if (d) d.classList.toggle('on', !!on);
   if (btn) btn.title = tip || '重启更新';
 }
+function updLastAt() { const n = Number(localStorage.getItem(UPD_KEY) || 0); return Number.isFinite(n) ? n : 0; }
+function updTodaySeven() { const d = new Date(); d.setHours(7, 0, 0, 0); return d.getTime(); }
+function updNextAt() {
+  const seven = updTodaySeven(), now = Date.now();
+  if (now < seven) return seven;                 // 今天还没到 7 点 → 今天 7 点查
+  if (updLastAt() < seven) return now;            // 已过 7 点且今天没查 → 立即补查
+  return seven + 24 * 60 * 60 * 1000;             // 今天已查 → 明天 7 点
+}
+function updReschedule() {
+  if (updTimer) { clearTimeout(updTimer); updTimer = 0; }
+  const ms = Math.max(1000, updNextAt() - Date.now());
+  updTimer = setTimeout(autoCheckUpdate, Math.min(ms, 2147000000));
+}
 async function autoCheckUpdate() {
   try {
     const j = await (await fetch('/api/update/check', { cache: 'no-store' })).json();
-    if (j && j.ok && j.hasUpdate) { updPending = j; updDot(true, '发现新版本 v' + j.latest + '，点击重启更新'); }
+    if (j && j.ok) {
+      localStorage.setItem(UPD_KEY, String(Date.now()));
+      if (j.hasUpdate) { updPending = j; updDot(true, '发现新版本 v' + j.latest + '，点击重启更新'); }
+      else { updPending = null; updDot(false); }
+    }
   } catch (e) {}
+  updReschedule();
 }
-setTimeout(autoCheckUpdate, 2000);
+updReschedule();
 async function checkUpdate() {
   const btn = $('updBtn');
   if (!btn) return;
@@ -5408,6 +5427,7 @@ async function checkUpdate() {
   try {
     const j = updPending || await (await fetch('/api/update/check', { cache: 'no-store' })).json();
     if (!j.ok) { toast(j.error || '暂时无法检查更新'); return; }
+    localStorage.setItem(UPD_KEY, String(Date.now()));
     if (!j.hasUpdate) { updPending = null; updDot(false); toast('已是最新版本（' + j.current + '）'); return; }
     updPending = j; updDot(true, '发现新版本 v' + j.latest + '，点击重启更新');
     const lines = [
@@ -5429,6 +5449,7 @@ async function checkUpdate() {
   } finally {
     btn.disabled = false;
     if (label) label.textContent = old;
+    updReschedule();
   }
 }
 // 轻提示
