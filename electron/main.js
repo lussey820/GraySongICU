@@ -471,7 +471,7 @@ async function watchAsrInstall() {
     if (s.ready) {
       msgBox({ type: 'info', title: '离线补歌词已就绪', message: '没有歌词的歌也能逐句滚动了。' });
     } else if (s.error) {
-      msgBox({ type: 'warning', title: '离线补歌词没有装好', message: '不影响正常使用。当前离线歌词暂未安装，如需安装请在安装时勾选。', detail: String(s.error) });
+      msgBox({ type: 'warning', title: '离线补歌词没有装好', message: '不影响正常使用。当前离线歌词暂未安装，如需安装请勾选。', detail: String(s.error) });
     }
     return;
   }
@@ -488,7 +488,7 @@ async function startInstallAsr() {
   } catch (e) {
     logLine('离线组件安装失败: ' + (e && e.message || e));
     setTaskProgress(-1);
-    msgBox({ type: 'warning', title: '离线补歌词没有装好', message: '不影响正常使用。当前离线歌词暂未安装，如需安装请在安装时勾选。', detail: String((e && e.message) || e) });
+    msgBox({ type: 'warning', title: '离线补歌词没有装好', message: '不影响正常使用。当前离线歌词暂未安装，如需安装请勾选。', detail: String((e && e.message) || e) });
   }
 }
 async function askInstallAsr() {

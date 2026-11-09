@@ -4900,7 +4900,7 @@ function asrPaint(s){
     box.innerHTML = '<div>正在下载离线补歌词组件' + prog + '…</div>' +
       '<div style="opacity:.75;margin-top:2px">约 150MB，只需下载一次。</div>';
   } else {
-    box.innerHTML = '<div>当前离线歌词暂未安装，如需安装请在安装时勾选。</div>' +
+    box.innerHTML = '<div>当前离线歌词暂未安装，如需安装请勾选。</div>' +
       (s.error ? '<div style="color:#ff8a80;margin-top:2px">上次安装失败：' + esc(s.error) + '</div>' : '') +
       '<div style="margin-top:6px"><button class="mini primary" onclick="asrInstall()">下载识别组件</button></div>';
   }
