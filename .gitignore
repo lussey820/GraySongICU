@@ -37,6 +37,10 @@ lyric-window.json
 electron/node_modules/
 electron/dist/
 
+# 项目内部记忆与规划文档 (不公开)
+MEMORY.md
+ROADMAP.md
+
 # 本地语音模型与环境 (体积大, 不入库)
 asr/models/
 asr/.venv/
