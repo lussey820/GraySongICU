@@ -1,5 +1,5 @@
 // GraySongICU 桌面外壳：启动本机服务、主窗口、托盘与桌面歌词
-const { app, BrowserWindow, Tray, Menu, screen, globalShortcut, ipcMain, shell, dialog, safeStorage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, screen, globalShortcut, ipcMain, shell, dialog, safeStorage, net: electronNet } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -206,6 +206,20 @@ function startHookServer() {
           try {
             const { kind, value } = JSON.parse(body);
             res.end(JSON.stringify(saveCookieSecure(kind, value)));
+          } catch (e) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ ok: false, error: '请求格式错误' }));
+          }
+        });
+        return;
+      }
+      if (u.pathname === '/update/apply') {
+        let body = '';
+        req.on('data', d => { body += d; if (body.length > 8192) req.destroy(); });
+        req.on('end', () => {
+          try {
+            const { url, sha256 } = JSON.parse(body);
+            res.end(JSON.stringify(applyUpdate(url, sha256)));
           } catch (e) {
             res.statusCode = 400;
             res.end(JSON.stringify({ ok: false, error: '请求格式错误' }));
@@ -490,6 +504,52 @@ async function startInstallAsr() {
     setTaskProgress(-1);
     msgBox({ type: 'warning', title: '离线补歌词没有装好', message: '不影响正常使用。当前离线歌词暂未安装，如需安装请勾选。', detail: String((e && e.message) || e) });
   }
+}
+function applyUpdate(url, sha256) {
+  const target = String(url || '');
+  let u = null;
+  try { u = new URL(target); } catch (e) {}
+  if (!u || u.protocol !== 'https:' || !/(^|\.)(github\.com|githubusercontent\.com)$/i.test(u.hostname)) {
+    return { ok: false, error: '更新地址不可信' };
+  }
+  const tmp = path.join(app.getPath('temp'), 'GraySongICU-Setup-update-' + Date.now() + '.exe');
+  const balloon = msg => {
+    logLine('更新: ' + msg);
+    try { if (tray && !tray.isDestroyed()) tray.displayBalloon({ title: 'GraySongICU 更新', content: msg }); } catch (e) {}
+  };
+  balloon('正在下载新版本，完成后会自动重启安装');
+  const req = electronNet.request({ method: 'GET', url: target, redirect: 'follow' });
+  req.on('response', res => {
+    if (res.statusCode !== 200) { balloon('更新下载失败（HTTP ' + res.statusCode + '）'); return; }
+    const ws = fs.createWriteStream(tmp);
+    const hash = crypto.createHash('sha256');
+    res.on('data', chunk => { hash.update(chunk); ws.write(chunk); });
+    res.on('end', () => ws.end(() => {
+      const got = hash.digest('hex');
+      const want = String(sha256 || '').toLowerCase();
+      if (want && got !== want) {
+        try { fs.unlinkSync(tmp); } catch (e) {}
+        balloon('更新包校验失败，已取消安装');
+        return;
+      }
+      balloon('下载完成，正在安装，应用即将重启');
+      try {
+        const child = spawn(tmp, [], { detached: true, stdio: 'ignore' });
+        child.unref();
+      } catch (e) {
+        balloon('无法启动安装程序: ' + (e && e.message || e));
+        return;
+      }
+      setTimeout(() => { isQuitting = true; app.quit(); }, 2000);
+    }));
+    res.on('error', () => {
+      try { ws.destroy(); } catch (e) {}
+      balloon('更新下载中断，请稍后重试');
+    });
+  });
+  req.on('error', e => balloon('更新下载失败: ' + (e && e.message || e)));
+  req.end();
+  return { ok: true, started: true };
 }
 async function askInstallAsr() {
   if (!IS_PACKAGED) return;

@@ -3664,6 +3664,8 @@ const PAGE = `<!DOCTYPE html>
   .guide-btn{display:flex;align-items:center;gap:6px;background:#fff;border:1px solid var(--line);border-radius:20px;padding:7px 12px;font-size:12.5px;color:var(--t2);cursor:pointer}
   .guide-btn:hover{border-color:#f3c9c9;color:var(--red)}
   .guide-btn .q{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:#f1f1f4;font-size:11px;font-weight:600;flex:none}
+  .upd-dot{display:none;width:7px;height:7px;border-radius:50%;background:var(--red);flex:none}
+  .upd-dot.on{display:inline-block}
   .guide-step{display:flex;gap:10px;padding:10px 0;font-size:13px;line-height:1.75;color:var(--t2)}
   .guide-step + .guide-step{border-top:1px solid var(--line-soft)}
   .guide-num{flex:none;width:20px;height:20px;border-radius:50%;background:var(--red);color:#fff;font-size:11.5px;display:flex;align-items:center;justify-content:center;margin-top:1px}
@@ -3872,7 +3874,7 @@ const PAGE = `<!DOCTYPE html>
     <div class="top-right">
       <button class="acct-btn lyr-btn" id="lyrBtn" onclick="toggleLyric()" title="桌面歌词（置顶字幕，跟随网易云播放）" aria-pressed="false"><span class="lyr-ico" aria-hidden="true">♪</span><span class="lyr-label" id="lyrLabel">歌词</span></button>
       <button class="account acct-btn" id="account" onclick="openAccount()" title="账号登录"><span class="dot"></span><span id="acctText">账号</span></button>
-      <button class="guide-btn" id="updBtn" onclick="checkUpdate()" title="检查更新"><span class="q">↑</span><span class="guide-label">检查更新</span></button>
+      <button class="guide-btn" id="updBtn" onclick="checkUpdate()" title="重启更新"><span class="q">↑</span><span class="guide-label">重启更新</span><i class="upd-dot" id="updDot"></i></button>
       <button class="guide-btn" onclick="openGuide()" title="快速上手"><span class="q">?</span><span class="guide-label">快速上手</span></button>
     </div>
   </div>
@@ -5382,7 +5384,20 @@ function openPick(mode) {
   lockScroll();
 }
 function closePick(){ $('pickModal').hidden = true; lockScroll(); }
-// 检查更新: 有新版本时直接打开发布页下载, 当前是绿色版/开发版也能用
+// 更新: 启动时静默检查一次, 有新版就在按钮上点个红点; 点按钮 = 下载并重启安装
+let updPending = null;
+function updDot(on, tip) {
+  const d = $('updDot'), btn = $('updBtn');
+  if (d) d.classList.toggle('on', !!on);
+  if (btn) btn.title = tip || '重启更新';
+}
+async function autoCheckUpdate() {
+  try {
+    const j = await (await fetch('/api/update/check', { cache: 'no-store' })).json();
+    if (j && j.ok && j.hasUpdate) { updPending = j; updDot(true, '发现新版本 v' + j.latest + '，点击重启更新'); }
+  } catch (e) {}
+}
+setTimeout(autoCheckUpdate, 2000);
 async function checkUpdate() {
   const btn = $('updBtn');
   if (!btn) return;
@@ -5391,17 +5406,24 @@ async function checkUpdate() {
   btn.disabled = true;
   if (label) label.textContent = '检查中…';
   try {
-    const r = await fetch('/api/update/check');
-    const j = await r.json();
+    const j = updPending || await (await fetch('/api/update/check', { cache: 'no-store' })).json();
     if (!j.ok) { toast(j.error || '暂时无法检查更新'); return; }
-    if (!j.hasUpdate) { toast('已是最新版本（' + j.current + '）'); return; }
+    if (!j.hasUpdate) { updPending = null; updDot(false); toast('已是最新版本（' + j.current + '）'); return; }
+    updPending = j; updDot(true, '发现新版本 v' + j.latest + '，点击重启更新');
     const lines = [
       '发现新版本 v' + j.latest + '（当前 ' + j.current + '）',
       '',
-      j.notes ? j.notes.slice(0, 400) : '点击确定打开下载页面。',
+      j.notes ? j.notes.slice(0, 400) : '',
       j.sha256 ? 'SHA256: ' + j.sha256 : '',
     ].filter(Boolean).join(String.fromCharCode(10));
-    if (j.url && confirm(lines + String.fromCharCode(10, 10) + '是否打开下载页面？')) window.open(j.url, '_blank');
+    if (j.url && !confirm(lines + String.fromCharCode(10, 10) + '现在下载更新吗？下载完成后会自动重启安装。')) return;
+    if (label) label.textContent = '下载中…';
+    const a = await (await fetch('/api/update/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: j.url, sha256: j.sha256 }),
+    })).json().catch(() => null);
+    if (a && a.ok) toast('正在后台下载更新，完成后会自动重启安装');
+    else { toast((a && a.error) || '无法自动更新，已打开下载页面'); window.open(j.url, '_blank'); }
   } catch (e) {
     toast('检查更新失败，请稍后再试');
   } finally {
@@ -6761,6 +6783,27 @@ function handleRequest(rq, rs) {
       logError('update', e);
       rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
       rs.end(JSON.stringify({ ok: false, error: friendlyError(e) }));
+    });
+    return;
+  }
+  if (rq.method === 'POST' && url === '/api/update/apply') {
+    let body = '';
+    rq.on('data', d => { body += d; if (body.length > 8192) { try { rq.destroy(); } catch (e) {} } });
+    rq.on('end', () => {
+      let j = {};
+      try { j = JSON.parse(body); } catch (e) {}
+      const target = String((j && j.url) || '');
+      const sha = String((j && j.sha256) || '');
+      if (!/^https:\/\/(github\.com|[a-z0-9-]+\.githubusercontent\.com)\//i.test(target)) {
+        rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        rs.end(JSON.stringify({ ok: false, web: true, error: '更新地址不可信' }));
+        return;
+      }
+      hookPost('/update/apply', { url: target, sha256: sha }).then(r => {
+        rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        if (r && r.ok) rs.end(JSON.stringify({ ok: true }));
+        else rs.end(JSON.stringify({ ok: false, web: true, error: (r && r.error) || '当前环境不支持自动更新' }));
+      });
     });
     return;
   }
