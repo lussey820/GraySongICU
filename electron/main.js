@@ -213,6 +213,10 @@ function startHookServer() {
         });
         return;
       }
+      if (u.pathname === '/update/status') {
+        res.end(JSON.stringify({ ok: true, job: updateJob }));
+        return;
+      }
       if (u.pathname === '/update/apply') {
         let body = '';
         req.on('data', d => { body += d; if (body.length > 8192) req.destroy(); });
@@ -259,6 +263,7 @@ async function startServer() {
       GRAYSONGICU_LYRIC_HOOK: 'http://127.0.0.1:' + hookPort,
       GRAYSONGICU_HOOK_TOKEN: HOOK_TOKEN,
       GRAYSONGICU_VERSION: app.getVersion(),
+      GRAYSONGICU_PACKAGED: IS_PACKAGED ? '1' : '',
       GRAYSONGICU_NCM_COOKIE: cookieStore.ncm,
       GRAYSONGICU_BILI_COOKIE: cookieStore.bili,
     },
@@ -419,6 +424,7 @@ function buildTrayMenu() {
     { label: '锁定歌词（鼠标穿透）', enabled: lyricOpen && !locked, click: () => applyLock(true) },
     { type: 'separator' },
     { label: '打开数据目录', click: () => shell.openPath(DATA_DIR) },
+    { label: '查看日志（诊断）', click: () => { try { shell.showItemInFolder(MAIN_LOG); } catch (e) {} } },
     { label: '退出 GraySongICU', click: () => { isQuitting = true; app.quit(); } },
   ]);
 }
@@ -505,6 +511,36 @@ async function startInstallAsr() {
     msgBox({ type: 'warning', title: '离线补歌词没有装好', message: '不影响正常使用。当前离线歌词暂未安装，如需安装请勾选。', detail: String((e && e.message) || e) });
   }
 }
+// 更新任务状态, 供页面轮询显示下载进度
+let updateJob = { state: 'idle', received: 0, total: 0, error: '' };
+function setUpdateJob(patch) { updateJob = { ...updateJob, ...patch }; }
+
+// 等待本进程退出 → 静默安装 → 无论装没装上, 都重新拉起应用
+function relaunchAfterInstall(installer) {
+  const q = s => "'" + String(s).replace(/'/g, "''") + "'";
+  const lines = [
+    '$targetPid = ' + process.pid,
+    '$inst = ' + q(installer),
+    '$exe = ' + q(process.execPath),
+    'while (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 400 }',
+    'Start-Sleep -Seconds 2',
+    'try { Start-Process -FilePath $inst -ArgumentList \'/S\' -Wait -WindowStyle Hidden } catch {}',
+    'Start-Sleep -Seconds 1',
+    'if (Test-Path $exe) { Start-Process -FilePath $exe }',
+  ];
+  const file = path.join(app.getPath('temp'), 'gsi-update-watchdog-' + Date.now() + '.ps1');
+  fs.writeFileSync(file, lines.join('\r\n'), 'utf8');
+  try {
+    const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', file], {
+      detached: true, stdio: 'ignore', windowsHide: true,
+    });
+    child.unref();
+    return true;
+  } catch (e) {
+    logLine('更新看门狗启动失败: ' + (e && e.message || e));
+    return false;
+  }
+}
 function applyUpdate(url, sha256) {
   const target = String(url || '');
   let u = null;
@@ -512,42 +548,52 @@ function applyUpdate(url, sha256) {
   if (!u || u.protocol !== 'https:' || !/(^|\.)(github\.com|githubusercontent\.com)$/i.test(u.hostname)) {
     return { ok: false, error: '更新地址不可信' };
   }
+  if (updateJob.state === 'downloading' || updateJob.state === 'installing') {
+    return { ok: true, started: true };
+  }
+  updateJob = { state: 'downloading', received: 0, total: 0, error: '' };
   const tmp = path.join(app.getPath('temp'), 'GraySongICU-Setup-update-' + Date.now() + '.exe');
   const balloon = msg => {
     logLine('更新: ' + msg);
     try { if (tray && !tray.isDestroyed()) tray.displayBalloon({ title: 'GraySongICU 更新', content: msg }); } catch (e) {}
   };
+  const fail = msg => { setUpdateJob({ state: 'error', error: msg }); balloon(msg); };
   balloon('正在下载新版本，完成后会自动重启安装');
   const req = electronNet.request({ method: 'GET', url: target, redirect: 'follow' });
   req.on('response', res => {
-    if (res.statusCode !== 200) { balloon('更新下载失败（HTTP ' + res.statusCode + '）'); return; }
+    if (res.statusCode !== 200) { fail('更新下载失败（HTTP ' + res.statusCode + '）'); return; }
+    const total = Number(res.headers['content-length'] || 0);
+    setUpdateJob({ total: total });
     const ws = fs.createWriteStream(tmp);
     const hash = crypto.createHash('sha256');
-    res.on('data', chunk => { hash.update(chunk); ws.write(chunk); });
+    res.on('data', chunk => {
+      hash.update(chunk);
+      ws.write(chunk);
+      setUpdateJob({ received: updateJob.received + chunk.length });
+    });
     res.on('end', () => ws.end(() => {
       const got = hash.digest('hex');
       const want = String(sha256 || '').toLowerCase();
       if (want && got !== want) {
         try { fs.unlinkSync(tmp); } catch (e) {}
-        balloon('更新包校验失败，已取消安装');
+        fail('更新包校验失败，已取消安装');
         return;
       }
-      balloon('下载完成，正在安装，应用即将重启');
-      try {
-        const child = spawn(tmp, [], { detached: true, stdio: 'ignore' });
-        child.unref();
-      } catch (e) {
-        balloon('无法启动安装程序: ' + (e && e.message || e));
+      setUpdateJob({ state: 'installing' });
+      balloon('下载完成，正在安装，应用会自动重启');
+      if (!relaunchAfterInstall(tmp)) {
+        fail('无法启动安装程序');
         return;
       }
-      setTimeout(() => { isQuitting = true; app.quit(); }, 2000);
+      setTimeout(() => { isQuitting = true; app.quit(); }, 600);
     }));
     res.on('error', () => {
       try { ws.destroy(); } catch (e) {}
-      balloon('更新下载中断，请稍后重试');
+      try { fs.unlinkSync(tmp); } catch (e) {}
+      fail('更新下载中断，请稍后重试');
     });
   });
-  req.on('error', e => balloon('更新下载失败: ' + (e && e.message || e)));
+  req.on('error', e => fail('更新下载失败: ' + (e && e.message || e)));
   req.end();
   return { ok: true, started: true };
 }

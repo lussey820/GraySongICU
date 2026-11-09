@@ -21,6 +21,10 @@ const MAX_CLOUD_BYTES = 200 * 1024 * 1024;
 // 留声机: 本地上传的封面暂存, 10 分钟内有效
 const localCovers = new Map();
 // 全局上传锁: 同一时间只允许一个上传任务, 避免多开页面同时打接口触发平台风控
+// 风控自适应退避: 连续命中风控时按 2 倍逐步拉长批次间等待, 上限 60 秒
+let riskStrikes = 0;
+function isRiskError(msg) { return /-412|风控|请求过于频繁|操作太频繁|频率/.test(String(msg || '')); }
+function riskBackoff(baseMs) { return Math.min(60000, baseMs * Math.pow(2, Math.min(riskStrikes, 3))); }
 let uploadBusy = false;
 function uploadBusyReply(rs) {
   rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -1608,15 +1612,17 @@ async function seasonUpload({ sid, mid }, opts, send) {
   send(`合集「${name}」共 ${archives.length} 个视频, 开始上传`);
   const results = [];
   for (let i = 0; i < archives.length; i++) {
-    if (i > 0) { send('为避免平台限制, 等待5秒后继续...'); await sleep(5000); }
+    if (i > 0) { const w = riskBackoff(5000); send(`为避免平台限制, 等待 ${Math.round(w / 1000)} 秒后继续...`); await sleep(w); }
     const bv = archives[i].bvid;
     send(`### [合集 ${i + 1}/${archives.length}] ${archives[i].title || bv} ###`);
     try {
       results.push(...await biliUpload(bv, { ...opts, season: false, _inner: true }, send));
+      riskStrikes = 0;
     } catch (e) {
       if (e.needSplit) throw e;
       logError('upload', e);
       const errMsg = friendlyError(e);
+      if (isRiskError(errMsg)) riskStrikes++;
       send(`✗ ${bv} 失败: ${errMsg}`);
       results.push({ input: bv, ok: false, error: errMsg });
       if (e.authFail || /-101/.test(e.message)) { send('B站登录已过期, 请在页面右上角重新登录; 已停止剩余视频'); break; }
@@ -1635,7 +1641,7 @@ async function runJobs(inputs, opts, send) {
     const item = inputs[i];
     if (i > 0) {
       // 批量时先单独传完第 1 条, 其余每条之间随机等待 6~9 秒, 降低连续请求带来的风控
-      const wait = 6000 + Math.floor(Math.random() * 3000);
+      const wait = riskBackoff(6000 + Math.floor(Math.random() * 3000));
       send(`已完成 ${i}/${inputs.length} 条, 为避免平台限制等待 ${Math.round(wait / 1000)} 秒后继续...`);
       await sleep(wait);
     }
@@ -1656,11 +1662,13 @@ async function runJobs(inputs, opts, send) {
         send(`\n##### 第 ${i + 1}/${inputs.length} 个任务 #####`);
         results.push(...await biliUpload(item, opts, send));
       }
+      riskStrikes = 0;
     } catch (e) {
       if (e.needSplit) throw e;
       logError('job', e);
       const errMsg = friendlyError(e);
       send(`✗ 任务失败: ${errMsg}`);
+      if (isRiskError(errMsg)) riskStrikes++;
       results.push({ input: item, ok: false, error: errMsg });
       if (e.authFail || /-101/.test(e.message)) { send('登录已失效, 终止剩余任务'); break; }
     }
@@ -3647,6 +3655,11 @@ const PAGE = `<!DOCTYPE html>
 
   .acct-modal{position:fixed;inset:0;z-index:60;background:rgba(24,24,28,.32);display:flex;align-items:center;justify-content:center;padding:16px}
   .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:80;background:rgba(31,31,34,.92);color:#fff;font-size:13px;padding:10px 18px;border-radius:9px;box-shadow:0 6px 24px rgba(0,0,0,.18);animation:toastIn .18s ease}
+  .upd-prog{display:none;position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:90;width:min(420px,86vw);background:rgba(31,31,34,.95);color:#fff;border-radius:10px;padding:12px 16px;box-shadow:0 8px 28px rgba(0,0,0,.22)}
+  .upd-prog.on{display:block}
+  .upd-prog-t{font-size:12.5px;margin-bottom:8px;opacity:.92}
+  .upd-prog-bar{height:4px;border-radius:2px;background:rgba(255,255,255,.18);overflow:hidden}
+  .upd-prog-bar i{display:block;height:100%;width:0;border-radius:2px;background:var(--red);transition:width .5s ease}
   @keyframes toastIn{from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}
   .acct-card{background:#fff;border-radius:14px;padding:18px 20px 16px;width:min(440px,100%);max-height:88vh;overflow:auto;box-shadow:0 12px 40px rgba(0,0,0,.16)}
   .acct-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-size:15px;font-weight:600;color:var(--t1)}
@@ -4104,6 +4117,7 @@ const PAGE = `<!DOCTYPE html>
 </div>
 
 <div class="toast" id="toast" hidden></div>
+<div class="upd-prog" id="updProg"><div class="upd-prog-t" id="updProgT">正在下载更新…</div><div class="upd-prog-bar"><i id="updProgFill"></i></div></div>
 
 <div class="acct-modal" id="listenModal" hidden>
   <div class="listen-card" role="dialog" aria-label="试听">
@@ -5417,6 +5431,42 @@ async function autoCheckUpdate() {
   updReschedule();
 }
 updReschedule();
+// 下载进度条: 主进程在后台下载, 页面轮询进度
+function updProgShow(txt) {
+  const p = $('updProg');
+  if (!p) return;
+  p.classList.add('on');
+  updProgSet(0, txt || '正在准备下载…');
+}
+function updProgHide() { const p = $('updProg'); if (p) p.classList.remove('on'); }
+function updProgSet(pct, txt) {
+  const f = $('updProgFill'), t = $('updProgT');
+  if (f) f.style.width = Math.max(0, Math.min(100, pct)) + '%';
+  if (t && txt) t.textContent = txt;
+}
+async function pollUpdateJob() {
+  for (let i = 0; i < 900; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    let j = null;
+    try { j = await (await fetch('/api/update/status', { cache: 'no-store' })).json(); } catch (e) {}
+    const job = j && j.job;
+    if (!job) return;
+    if (job.state === 'downloading') {
+      const mb = n => (Number(n || 0) / 1048576).toFixed(1);
+      const pct = job.total ? Math.round(job.received / job.total * 100) : 0;
+      updProgSet(pct, '正在下载更新 ' + pct + '%' + (job.total ? '（' + mb(job.received) + ' / ' + mb(job.total) + ' MB）' : ''));
+    } else if (job.state === 'installing') {
+      updProgSet(100, '下载完成，正在安装并重启…');
+    } else if (job.state === 'error') {
+      updProgSet(100, '更新失败：' + (job.error || '未知错误'));
+      setTimeout(updProgHide, 8000);
+      return;
+    } else if (job.state === 'idle') {
+      updProgHide();
+      return;
+    }
+  }
+}
 async function checkUpdate() {
   const btn = $('updBtn');
   if (!btn) return;
@@ -5442,7 +5492,7 @@ async function checkUpdate() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: j.url, sha256: j.sha256 }),
     })).json().catch(() => null);
-    if (a && a.ok) toast('正在后台下载更新，完成后会自动重启安装');
+    if (a && a.ok) { toast('正在后台下载更新，完成后会自动重启安装'); updProgShow(); pollUpdateJob(); }
     else { toast((a && a.error) || '无法自动更新，已打开下载页面'); window.open(j.url, '_blank'); }
   } catch (e) {
     toast('检查更新失败，请稍后再试');
@@ -6828,6 +6878,13 @@ function handleRequest(rq, rs) {
     });
     return;
   }
+  if (rq.method === 'GET' && url === '/api/update/status') {
+    hookPost('/update/status', {}).then(r => {
+      rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      rs.end(JSON.stringify({ ok: !!(r && r.ok), job: (r && r.job) || null }));
+    });
+    return;
+  }
   if (rq.method === 'GET' && url === '/api/qr/svg') {
     try {
       const text = new URL(rq.url, 'http://x').searchParams.get('text') || '';
@@ -6956,6 +7013,12 @@ function handleRequest(rq, rs) {
     return;
   }
   if (url === '/api/push' && (rq.method === 'POST' || rq.method === 'OPTIONS')) {
+    // 正式版关闭调试用的推送接口(仅开发/浏览器调试时可用)
+    if (process.env.GRAYSONGICU_PACKAGED === '1') {
+      rs.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+      rs.end('{"ok":false}');
+      return;
+    }
     rs.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'content-type', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Cache-Control': 'no-store' });
     if (rq.method === 'OPTIONS') return rs.end('{}');
     let body = '';
